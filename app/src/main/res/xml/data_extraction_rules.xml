@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 排除含明文 HTTP 认证密码的偏好文件：云备份与设备迁移均不携带 -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="camera_prefs.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="camera_prefs.xml" />
+    </device-transfer>
+</data-extraction-rules>

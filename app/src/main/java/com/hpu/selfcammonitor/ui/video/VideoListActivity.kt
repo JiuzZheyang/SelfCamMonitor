@@ -1,0 +1,520 @@
+package com.hpu.selfcammonitor.ui.video
+
+import android.content.Intent
+import android.media.MediaMetadataRetriever
+import android.net.Uri
+import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
+import android.util.Log
+import android.view.Gravity
+import android.view.View
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
+import android.widget.Button
+import android.widget.EditText
+import android.widget.ImageButton
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.cardview.widget.CardView
+import androidx.core.content.FileProvider
+import androidx.documentfile.provider.DocumentFile
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.hpu.selfcammonitor.R
+import java.io.File
+import java.io.FileInputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class VideoListActivity : AppCompatActivity() {
+
+    private lateinit var recyclerView: RecyclerView
+    private lateinit var adapter: VideoAdapter
+    private lateinit var tvTitle: TextView
+    private lateinit var tvFileCount: TextView
+    private lateinit var tvSelectedCount: TextView
+    private lateinit var btnBack: ImageButton
+    private lateinit var btnSelectAll: Button
+    private lateinit var btnCancelSelect: Button
+    private lateinit var btnDelete: Button
+    private lateinit var btnExport: Button
+    private lateinit var buttonCard: LinearLayout
+
+    // 搜索相关
+    private lateinit var searchBar: CardView
+    private lateinit var etSearch: EditText
+    private lateinit var btnClearSearch: ImageButton
+
+    // 空状态提示
+    private lateinit var emptyView: LinearLayout
+    private lateinit var tvEmptyText: TextView
+
+    private var allVideos: List<File> = emptyList()
+    private var currentVideos: List<File> = emptyList()
+    private var isSelectMode = false
+    private val selectedVideos = mutableSetOf<File>()
+
+    // 元数据缓存
+    private var dateTimeMap = HashMap<File, String>()
+    private var durationMap = HashMap<File, String>()
+    private var cachedFilesSignature = 0
+
+    private lateinit var folderPath: String
+
+    private val pickDocumentLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        uri?.let { exportSelectedVideos(it) }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_video_list)
+
+        folderPath = intent.getStringExtra("folder_path") ?: run {
+            finish()
+            return
+        }
+
+        initViews()
+        loadVideos()
+        setupAdapter()
+        setupListeners()
+        setupSearchBar()
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (isSelectMode) {
+                    exitSelectMode()
+                } else {
+                    // 注意：这里不能直接调用 super.onBackPressed()
+                    // 需要调用 finish() 或传递给上一个回调
+                    finish()
+                }
+            }
+        })
+    }
+
+    private fun initViews() {
+        recyclerView = findViewById(R.id.recyclerView)
+        recyclerView.layoutManager = LinearLayoutManager(this)
+        tvTitle = findViewById(R.id.tvTitle)
+        tvFileCount = findViewById(R.id.tvFileCount)
+        tvSelectedCount = findViewById(R.id.tvSelectedCount)
+        btnBack = findViewById(R.id.btnBack)
+        btnSelectAll = findViewById(R.id.btnSelectAll)
+        btnCancelSelect = findViewById(R.id.btnCancelSelect)
+        btnDelete = findViewById(R.id.btnDelete)
+        btnExport = findViewById(R.id.btnExport)
+        buttonCard = findViewById(R.id.buttonCard)
+
+        searchBar = findViewById(R.id.searchBar)
+        etSearch = findViewById(R.id.etSearch)
+        btnClearSearch = findViewById(R.id.btnClearSearch)
+
+        emptyView = findViewById(R.id.emptyView)
+        tvEmptyText = findViewById(R.id.tvEmptyText)
+
+        val folderFile = File(folderPath)
+        tvTitle.text = folderFile.name
+    }
+
+    private fun loadVideos() {
+        val folder = File(folderPath)
+        val newFiles = if (folder.exists()) {
+            folder.listFiles()?.filter { it.extension == "mp4" }?.sortedByDescending { it.lastModified() } ?: emptyList()
+        } else emptyList()
+
+        val newSignature = newFiles.hashCode()
+        if (cachedFilesSignature != newSignature) {
+            cachedFilesSignature = newSignature
+            dateTimeMap.clear()
+            durationMap.clear()
+        }
+
+        allVideos = newFiles
+        currentVideos = allVideos
+
+        if (dateTimeMap.isEmpty() || durationMap.isEmpty()) {
+            loadMetadataAsync()
+        }
+        updateEmptyState()
+    }
+
+    private fun loadMetadataAsync() {
+        Thread {
+            val newDateTimeMap = HashMap<File, String>()
+            val newDurationMap = HashMap<File, String>()
+            val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+            val retriever = MediaMetadataRetriever()
+
+            for (file in allVideos) {
+                val dateTimeStr = extractDateTimeFromFileName(file.name) ?: sdf.format(Date(file.lastModified()))
+                newDateTimeMap[file] = dateTimeStr
+
+                try {
+                    retriever.setDataSource(file.absolutePath)
+                    val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                    newDurationMap[file] = formatDuration(durationMs)
+                } catch (e: Exception) {
+                    newDurationMap[file] = "未知"
+                }
+            }
+            retriever.release()
+
+            runOnUiThread {
+                dateTimeMap = newDateTimeMap
+                durationMap = newDurationMap
+                adapter?.updateMetadata(dateTimeMap, durationMap)
+            }
+        }.start()
+    }
+
+    private fun extractDateTimeFromFileName(fileName: String): String? {
+        // 文件名由 CameraService 生成：
+        //   运动触发录像 motion_<Unix毫秒时间戳>.mp4
+        //   连续录像     video_<Unix毫秒时间戳>.mp4
+        val pattern = Regex("(?:motion|video)_(\\d+)\\.mp4")
+        pattern.find(fileName)?.let {
+            val timestamp = it.groupValues[1].toLongOrNull() ?: return null
+            return try {
+                SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+                    .format(Date(timestamp))
+            } catch (e: Exception) {
+                null
+            }
+        }
+        return null
+    }
+
+    private fun formatDuration(millis: Long): String {
+        if (millis <= 0) return "0:00"
+        val seconds = millis / 1000
+        val hours = seconds / 3600
+        val minutes = (seconds % 3600) / 60
+        val secs = seconds % 60
+        return if (hours > 0) String.format("%d:%02d:%02d", hours, minutes, secs)
+        else String.format("%d:%02d", minutes, secs)
+    }
+
+    private fun setupAdapter() {
+        adapter = VideoAdapter(
+            inflater = layoutInflater,
+            videos = currentVideos,
+            onVideoPlayClick = { video ->       // 普通模式点击播放
+                if (!isSelectMode) {
+                    playVideo(video)
+                }
+            },
+            onEnterSelectMode = { video ->     // 长按进入多选模式
+                if (!isSelectMode) {
+                    enterSelectMode(video)
+                }
+            }
+        )
+
+        // 设置选中数量变化回调
+        adapter.onSelectionChanged = { count ->
+            runOnUiThread {
+                updateSelectedCount()
+                updateDeleteButton()
+            }
+        }
+
+        // 同步初始状态
+        adapter.isSelectMode = isSelectMode
+        adapter.selectedVideos = selectedVideos
+        adapter.updateMetadata(dateTimeMap, durationMap)
+
+        recyclerView.adapter = adapter
+        updateFileCountDisplay()
+    }
+
+    private fun setupSearchBar() {
+        etSearch.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                btnClearSearch.visibility = if (s.isNullOrEmpty()) View.GONE else View.VISIBLE
+            }
+            override fun afterTextChanged(s: Editable?) {}
+        })
+
+        btnClearSearch.setOnClickListener {
+            if (etSearch.text.isNotEmpty()) {
+                // 有文字：清空输入框，并触发搜索（刷新为全部列表）
+                etSearch.text.clear()
+                performSearch()   // 这会重新根据空关键词过滤，显示全部视频
+                // 焦点保留，键盘不隐藏（clear 后焦点会自动保留）
+            } else {
+                // 无文字：隐藏键盘并清除焦点
+                etSearch.clearFocus()
+                val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+                imm.hideSoftInputFromWindow(etSearch.windowToken, 0)
+            }
+        }
+
+        etSearch.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                performSearch()
+                true
+            } else false
+        }
+    }
+
+    private fun performSearch() {
+        val keyword = etSearch.text.toString().trim().lowercase()
+        currentVideos = if (keyword.isEmpty()) allVideos
+        else allVideos.filter { it.name.lowercase().contains(keyword) }
+        adapter.updateData(currentVideos)
+        updateFileCountDisplay()
+        updateEmptyState()
+        currentFocus?.clearFocus()
+    }
+
+    // 空状态切换：无视频/搜索无结果时显示占位提示
+    private fun updateEmptyState() {
+        if (currentVideos.isEmpty()) {
+            emptyView.visibility = View.VISIBLE
+            recyclerView.visibility = View.GONE
+            tvEmptyText.text = if (allVideos.isEmpty()) "暂无视频" else "没有匹配的视频"
+        } else {
+            emptyView.visibility = View.GONE
+            recyclerView.visibility = View.VISIBLE
+        }
+    }
+
+    private fun setupListeners() {
+        btnBack.setOnClickListener { finish() }
+
+        btnSelectAll.setOnClickListener {
+            if (selectedVideos.size == currentVideos.size) {
+                selectedVideos.clear()
+            } else {
+                selectedVideos.clear()
+                selectedVideos.addAll(currentVideos)
+            }
+            adapter.selectedVideos = selectedVideos
+            adapter.onSelectionChanged?.invoke(selectedVideos.size)
+            adapter.notifyDataSetChanged()
+            updateSelectedCount()
+            updateDeleteButton()
+        }
+
+        btnCancelSelect.setOnClickListener { exitSelectMode() }
+        btnDelete.setOnClickListener { deleteSelectedVideos() }
+        btnExport.setOnClickListener { if (selectedVideos.isNotEmpty()) showExportSelector() }
+    }
+
+    private fun enterSelectMode(firstVideo: File) {
+        isSelectMode = true
+        selectedVideos.clear()
+        selectedVideos.add(firstVideo)
+        adapter.isSelectMode = true
+        adapter.selectedVideos = selectedVideos
+        adapter.onSelectionChanged?.invoke(selectedVideos.size)
+        adapter.notifyDataSetChanged()   // 刷新所有 item 以切换点击模式
+        showSelectUI()
+        updateSelectedCount()
+        updateDeleteButton()
+    }
+
+    private fun exitSelectMode() {
+        isSelectMode = false
+        selectedVideos.clear()
+        adapter.isSelectMode = false
+        adapter.selectedVideos = selectedVideos
+        adapter.onSelectionChanged?.invoke(0)
+        adapter.notifyDataSetChanged()
+        hideSelectUI()
+    }
+
+    private fun toggleSelection(video: File) {
+        if (selectedVideos.contains(video)) selectedVideos.remove(video)
+        else selectedVideos.add(video)
+        adapter.selectedVideos = selectedVideos
+        adapter.notifyDataSetChanged()
+        updateSelectedCount()
+        updateDeleteButton()
+    }
+
+    private fun updateSelectedCount() {
+        val count = selectedVideos.size
+        tvSelectedCount.text = "已选 $count 项"
+        // 调试日志
+        Log.d("VideoList", "选中数量: $count")
+    }
+
+    private fun updateDeleteButton() {
+        btnDelete.isEnabled = selectedVideos.isNotEmpty()
+        updateButtonCardVisibility()
+    }
+
+    private fun updateButtonCardVisibility() {
+        buttonCard.visibility = if (isSelectMode && selectedVideos.isNotEmpty()) View.VISIBLE else View.GONE
+    }
+
+    private fun showSelectUI() {
+        // 隐藏普通模式控件
+        btnBack.visibility = View.GONE
+        tvTitle.visibility = View.GONE
+        tvFileCount.visibility = View.GONE
+        // 隐藏搜索栏（新增）
+        searchBar.visibility = View.GONE
+        // 显示多选模式控件
+        btnSelectAll.visibility = View.VISIBLE
+        tvSelectedCount.visibility = View.VISIBLE
+        btnCancelSelect.visibility = View.VISIBLE
+        updateSelectedCount()
+        updateButtonCardVisibility()
+    }
+
+    private fun hideSelectUI() {
+        // 显示普通模式控件
+        btnBack.visibility = View.VISIBLE
+        tvTitle.visibility = View.VISIBLE
+        tvFileCount.visibility = View.VISIBLE
+        // 显示搜索栏（新增）
+        searchBar.visibility = View.VISIBLE
+        // 隐藏多选模式控件
+        btnSelectAll.visibility = View.GONE
+        tvSelectedCount.visibility = View.GONE
+        btnCancelSelect.visibility = View.GONE
+        buttonCard.visibility = View.GONE
+        updateFileCountDisplay()
+    }
+
+    private fun updateFileCountDisplay() {
+        val count = currentVideos.size
+        tvFileCount.text = "共 $count 个视频"
+    }
+
+    private fun deleteSelectedVideos() {
+        val toDelete = selectedVideos.toSet()
+        if (toDelete.isEmpty()) return
+        AlertDialog.Builder(this)
+            .setTitle("确认删除")
+            .setMessage("删除 ${toDelete.size} 个视频？")
+            .setPositiveButton("删除") { _, _ ->
+                for (video in toDelete) {
+                    video.delete()
+                }
+                loadVideos()
+                currentVideos = allVideos
+                exitSelectMode()
+                adapter.updateData(currentVideos)
+                updateFileCountDisplay()
+                updateEmptyState()
+                loadMetadataAsync()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun showExportSelector() {
+        AlertDialog.Builder(this)
+            .setTitle("导出选中视频")
+            .setMessage("将 ${selectedVideos.size} 个视频导出到外部存储")
+            .setPositiveButton("选择文件夹") { _, _ ->
+                pickDocumentLauncher.launch(null)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /**
+     * 显示不可取消的导出进度对话框（替代已弃用的 ProgressDialog：
+     * 使用 AlertDialog + 不确定进度条 + 提示文本）
+     */
+    private fun showExportProgressDialog(message: String): AlertDialog {
+        val density = resources.displayMetrics.density
+        val progressBar = ProgressBar(this).apply { isIndeterminate = true }
+        val textView = TextView(this).apply {
+            text = message
+            textSize = 16f
+            setPadding((24 * density).toInt(), 0, 0, 0)
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            val hp = (24 * density).toInt()
+            val vp = (16 * density).toInt()
+            setPadding(hp, vp, hp, vp)
+            addView(progressBar)
+            addView(textView)
+        }
+        return AlertDialog.Builder(this)
+            .setView(container)
+            .setCancelable(false)
+            .create()
+            .apply { show() }
+    }
+
+    private fun exportSelectedVideos(treeUri: Uri) {
+        if (selectedVideos.isEmpty()) return
+        val progress = showExportProgressDialog("正在导出 ${selectedVideos.size} 个视频...")
+
+        val rootDocument = DocumentFile.fromTreeUri(this, treeUri)
+        var successCount = 0
+        val failedFiles = mutableListOf<String>()
+
+        for (video in selectedVideos) {
+            try {
+                if (copyFileToDocument(video, rootDocument)) {
+                    successCount++
+                } else {
+                    failedFiles.add(video.name)
+                }
+            } catch (e: Exception) {
+                failedFiles.add(video.name)
+            }
+        }
+
+        progress.dismiss()
+        val message = if (failedFiles.isEmpty()) "成功导出 $successCount 个文件"
+        else "成功导出 $successCount 个文件，失败：${failedFiles.joinToString()}"
+        AlertDialog.Builder(this)
+            .setTitle("导出完成")
+            .setMessage(message)
+            .setPositiveButton("确定") { _, _ -> exitSelectMode() }
+            .show()
+    }
+
+    private fun copyFileToDocument(sourceFile: File, rootDocument: DocumentFile?): Boolean {
+        // createFile 会立即在用户选定的外部目录落下一个 0 字节文件。
+        // 该目录不在 App 的 Recordings 扫描范围内，一旦留下失败残骸 App 再也看不到、也无从清理
+        // （只能用户自己开文件管理器删），因此每个失败分支都必须回滚目标文件。
+        val destFile = rootDocument?.createFile("video/mp4", sourceFile.name) ?: return false
+        return try {
+            val destStream = contentResolver.openOutputStream(destFile.uri)
+            if (destStream == null) {
+                // 目标流打不开（URI 权限失效、目标卷不可写）：删掉刚创建的空文件
+                try { destFile.delete() } catch (_: Exception) {}
+                false
+            } else {
+                // use 嵌套：源流与目标流在异常路径上也必定及时关闭，不再等 GC
+                FileInputStream(sourceFile).use { src -> destStream.use { dst -> src.copyTo(dst, 8192) } }
+                true
+            }
+        } catch (e: Exception) {
+            // 复制中途失败（目标空间不足、进程被回收等）：删除半截文件，不留残骸
+            try { destFile.delete() } catch (_: Exception) {}
+            false
+        }
+    }
+
+    private fun playVideo(file: File) {
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "video/mp4")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(intent, "播放视频"))
+    }
+}

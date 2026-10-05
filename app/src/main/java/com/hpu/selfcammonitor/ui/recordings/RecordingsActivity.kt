@@ -1,0 +1,381 @@
+package com.hpu.selfcammonitor.ui.recordings // 请根据你的实际包名修改
+
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.util.Log
+import android.view.Gravity
+import android.view.View
+import android.widget.Button
+import android.widget.ImageButton
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.documentfile.provider.DocumentFile
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.hpu.selfcammonitor.R
+import com.hpu.selfcammonitor.ui.video.VideoListActivity
+import java.io.File
+import java.io.FileInputStream
+
+class RecordingsActivity : AppCompatActivity() {
+
+    private lateinit var recyclerView: RecyclerView
+    private lateinit var adapter: FolderAdapter
+    private lateinit var tvFileCount: TextView
+    private lateinit var tvSelectedCount: TextView
+    private lateinit var btnSelectAll: Button
+    private lateinit var btnCancelSelect: Button
+    private lateinit var btnDelete: Button
+    private lateinit var btnExport: Button
+    private lateinit var buttonCard: LinearLayout
+    private lateinit var btnBack: ImageButton
+    private var folderList: List<File> = emptyList()
+    private var isSelectMode = false
+    private val selectedFolders = mutableSetOf<File>()
+    private lateinit var emptyView: LinearLayout
+
+    private val pickDocumentLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        uri?.let { exportSelectedFolders(it) }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_recordings)
+
+        recyclerView = findViewById(R.id.recyclerView)
+        recyclerView.layoutManager = LinearLayoutManager(this)
+        tvFileCount = findViewById(R.id.tvFileCount)
+        tvSelectedCount = findViewById(R.id.tvSelectedCount)
+        btnSelectAll = findViewById(R.id.btnSelectAll)
+        btnCancelSelect = findViewById(R.id.btnCancelSelect)
+        btnDelete = findViewById(R.id.btnDelete)
+        btnExport = findViewById(R.id.btnExport)
+        buttonCard = findViewById(R.id.buttonCard)
+        emptyView = findViewById(R.id.emptyView)
+        // 绑定返回按钮
+        btnBack = findViewById(R.id.btnBack)
+        btnBack.setOnClickListener {
+            if (isSelectMode) {
+                exitSelectMode()
+            } else {
+                finish()
+            }
+        }
+
+        loadFolderList()
+        setupAdapter()
+
+        btnSelectAll.setOnClickListener {
+            if (selectedFolders.size == folderList.size) {
+                selectedFolders.clear()
+            } else {
+                selectedFolders.clear()
+                selectedFolders.addAll(folderList)
+            }
+            adapter.selectedFolders = selectedFolders
+            adapter.notifyDataSetChanged()
+            adapter.onSelectionChanged?.invoke(selectedFolders.size)
+            updateSelectedCount()
+            updateDeleteButton()
+        }
+
+        btnCancelSelect.setOnClickListener { exitSelectMode() }
+        btnDelete.setOnClickListener { deleteSelectedFolders() }
+        btnExport.setOnClickListener { if (selectedFolders.isNotEmpty()) showExportFolderSelector() }
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (isSelectMode) {
+                    exitSelectMode()
+                } else {
+                    finish()
+                }
+            }
+        })
+    }
+
+    private fun loadFolderList() {
+        val dir = File(getExternalFilesDir(null), "Recordings")
+        folderList = if (dir.exists()) {
+            dir.listFiles()?.filter { it.isDirectory && it.name.matches(Regex("\\d{4}-\\d{2}-\\d{2}")) }
+                ?.sortedByDescending { it.name } ?: emptyList()
+        } else emptyList()
+    }
+
+    private fun setupAdapter() {
+        adapter = FolderAdapter(folderList,
+            onFolderClick = { folder ->
+                // 普通模式：进入视频列表
+                val intent = Intent(this, VideoListActivity::class.java)
+                intent.putExtra("folder_path", folder.absolutePath)
+                startActivity(intent)
+            },
+            onFolderLongClick = { folder ->
+                if (!isSelectMode) {
+                    enterSelectMode(folder)
+                    true
+                } else false
+            }
+        )
+        // 设置选中状态变化回调，更新顶部计数
+        adapter.onSelectionChanged = { count ->
+            runOnUiThread {
+                updateSelectedCount()
+                updateDeleteButton()
+            }
+        }
+        recyclerView.adapter = adapter
+        updateFileCountDisplay()
+        updateEmptyState()
+    }
+
+    // 空状态切换：没有任何录像文件夹时显示占位提示
+    private fun updateEmptyState() {
+        if (folderList.isEmpty()) {
+            emptyView.visibility = View.VISIBLE
+            recyclerView.visibility = View.GONE
+        } else {
+            emptyView.visibility = View.GONE
+            recyclerView.visibility = View.VISIBLE
+        }
+    }
+
+    private fun enterSelectMode(firstFolder: File) {
+        isSelectMode = true
+        selectedFolders.clear()
+        selectedFolders.add(firstFolder)
+        adapter.isSelectMode = true
+        adapter.selectedFolders = selectedFolders
+        adapter.onSelectionChanged?.invoke(selectedFolders.size)
+        adapter.notifyDataSetChanged()
+        showSelectUI()
+        updateSelectedCount()
+        updateDeleteButton()
+    }
+
+    private fun exitSelectMode() {
+        isSelectMode = false
+        selectedFolders.clear()
+        adapter.isSelectMode = false
+        adapter.selectedFolders = selectedFolders
+        adapter.notifyDataSetChanged()
+        hideSelectUI()
+    }
+
+    private fun updateDeleteButton() {
+        btnDelete.isEnabled = selectedFolders.isNotEmpty()
+        updateButtonCardVisibility()
+    }
+
+    private fun updateButtonCardVisibility() {
+        buttonCard.visibility = if (isSelectMode && selectedFolders.isNotEmpty()) View.VISIBLE else View.GONE
+    }
+
+    private fun showSelectUI() {
+        btnBack.visibility = View.GONE
+        tvFileCount.visibility = View.GONE
+        btnSelectAll.visibility = View.VISIBLE
+        tvSelectedCount.visibility = View.VISIBLE
+        btnCancelSelect.visibility = View.VISIBLE
+        updateSelectedCount()
+        updateButtonCardVisibility()
+    }
+
+    private fun hideSelectUI() {
+        btnBack.visibility = View.VISIBLE
+        tvFileCount.visibility = View.VISIBLE
+        btnSelectAll.visibility = View.GONE
+        tvSelectedCount.visibility = View.GONE
+        btnCancelSelect.visibility = View.GONE
+        buttonCard.visibility = View.GONE
+        updateFileCountDisplay()
+    }
+
+    private fun updateFileCountDisplay() {
+        tvFileCount.text = "共 ${folderList.size} 个文件夹"
+    }
+
+    private fun updateSelectedCount() {
+        tvSelectedCount.text = "已选 ${selectedFolders.size} 项"
+    }
+
+    private fun deleteSelectedFolders() {
+        val toDelete = selectedFolders.toSet()
+        if (toDelete.isEmpty()) return
+        AlertDialog.Builder(this)
+            .setTitle("确认删除")
+            .setMessage("删除 ${toDelete.size} 个文件夹及其中的所有视频？")
+            .setPositiveButton("删除") { _, _ ->
+                for (folder in toDelete) {
+                    folder.deleteRecursively()
+                }
+                loadFolderList()
+                exitSelectMode()
+                setupAdapter()
+                updateFileCountDisplay()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun showExportFolderSelector() {
+        AlertDialog.Builder(this)
+            .setTitle("选择导出位置")
+            .setMessage("将选中的 ${selectedFolders.size} 个文件夹导出到外部存储")
+            .setPositiveButton("选择文件夹") { _, _ ->
+                pickDocumentLauncher.launch(null)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /**
+     * 显示不可取消的导出进度对话框（替代已弃用的 ProgressDialog：
+     * 使用 AlertDialog + 不确定进度条 + 提示文本）
+     */
+    private fun showExportProgressDialog(message: String): AlertDialog {
+        val density = resources.displayMetrics.density
+        val progressBar = ProgressBar(this).apply { isIndeterminate = true }
+        val textView = TextView(this).apply {
+            text = message
+            textSize = 16f
+            setPadding((24 * density).toInt(), 0, 0, 0)
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            val hp = (24 * density).toInt()
+            val vp = (16 * density).toInt()
+            setPadding(hp, vp, hp, vp)
+            addView(progressBar)
+            addView(textView)
+        }
+        return AlertDialog.Builder(this)
+            .setView(container)
+            .setCancelable(false)
+            .create()
+            .apply { show() }
+    }
+
+    /**
+     * 导出选中的文件夹（递归复制文件夹内所有 MP4 文件到用户选择的目标目录）
+     */
+    private fun exportSelectedFolders(treeUri: Uri) {
+        if (selectedFolders.isEmpty()) return
+
+        // 统计所有需要导出的文件（仅 MP4）
+        val allFiles = selectedFolders.flatMap { folder ->
+            folder.walkTopDown()
+                .filter { it.isFile && it.extension.equals("mp4", ignoreCase = true) }
+                .toList()
+        }
+        if (allFiles.isEmpty()) {
+            Toast.makeText(this, "所选文件夹中没有视频文件", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val progress = showExportProgressDialog("正在导出 ${allFiles.size} 个视频...")
+
+        val rootDocument = DocumentFile.fromTreeUri(this, treeUri)
+        if (rootDocument == null) {
+            progress.dismiss()
+            Toast.makeText(this, "无法访问目标文件夹", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        var totalSuccess = 0
+        val failedFiles = mutableListOf<String>()
+
+        for (sourceFolder in selectedFolders) {
+            // 在目标目录中创建同名子文件夹
+            val targetFolder = rootDocument.findFile(sourceFolder.name) ?: rootDocument.createDirectory(sourceFolder.name)
+            if (targetFolder == null) {
+                // 创建失败，记录该文件夹下所有文件失败
+                sourceFolder.walkTopDown()
+                    .filter { it.isFile && it.extension.equals("mp4", ignoreCase = true) }
+                    .forEach { failedFiles.add("${sourceFolder.name}/${it.name}") }
+                continue
+            }
+            // 递归复制文件夹内的视频文件，累加成功数量
+            totalSuccess += copyFolderRecursively(sourceFolder, targetFolder, failedFiles)
+        }
+
+        progress.dismiss()
+        val message = if (failedFiles.isEmpty()) {
+            "成功导出 $totalSuccess 个文件"
+        } else {
+            "成功导出 $totalSuccess 个文件，失败：${failedFiles.joinToString(limit = 5)}"
+        }
+        AlertDialog.Builder(this)
+            .setTitle("导出完成")
+            .setMessage(message)
+            .setPositiveButton("确定") { _, _ -> exitSelectMode() }
+            .show()
+    }
+
+    /**
+     * 递归复制文件夹内的 MP4 文件到目标 DocumentFile 目录，返回成功复制的文件数量
+     */
+    private fun copyFolderRecursively(
+        sourceFolder: File,
+        targetFolder: DocumentFile,
+        failedFiles: MutableList<String>
+    ): Int {
+        var successCount = 0
+        sourceFolder.listFiles()?.forEach { file ->
+            if (file.isDirectory) {
+                // 在目标下创建子目录
+                val subTarget = targetFolder.findFile(file.name) ?: targetFolder.createDirectory(file.name)
+                if (subTarget != null) {
+                    successCount += copyFolderRecursively(file, subTarget, failedFiles)
+                } else {
+                    // 子目录创建失败，记录该子目录下所有文件失败
+                    file.walkTopDown()
+                        .filter { it.isFile && it.extension.equals("mp4", ignoreCase = true) }
+                        .forEach { failedFiles.add("${sourceFolder.name}/${it.name}") }
+                }
+            } else if (file.isFile && file.extension.equals("mp4", ignoreCase = true)) {
+                if (copyFileToDocument(file, targetFolder)) {
+                    successCount++
+                } else {
+                    failedFiles.add("${sourceFolder.name}/${file.name}")
+                }
+            }
+        }
+        return successCount
+    }
+
+    /**
+     * 复制单个视频文件到指定的 DocumentFile 目录
+     */
+    private fun copyFileToDocument(sourceFile: File, targetDir: DocumentFile): Boolean {
+        // createFile 会立即在用户选定的外部目录落下一个 0 字节文件。
+        // 该目录不在 App 的 Recordings 扫描范围内，一旦留下失败残骸 App 再也看不到、也无从清理
+        // （只能用户自己开文件管理器删），因此每个失败分支都必须回滚目标文件。
+        val destFile = targetDir.createFile("video/mp4", sourceFile.name) ?: return false
+        return try {
+            val destStream = contentResolver.openOutputStream(destFile.uri)
+            if (destStream == null) {
+                // 目标流打不开（URI 权限失效、目标卷不可写）：删掉刚创建的空文件
+                try { destFile.delete() } catch (_: Exception) {}
+                false
+            } else {
+                // use 嵌套：源流与目标流在异常路径上也必定及时关闭，不再等 GC
+                FileInputStream(sourceFile).use { src -> destStream.use { dst -> src.copyTo(dst, 8192) } }
+                true
+            }
+        } catch (e: Exception) {
+            // 复制中途失败（目标空间不足、进程被回收等）：删除半截文件，不留残骸
+            try { destFile.delete() } catch (_: Exception) {}
+            android.util.Log.e("Export", "复制失败: ${sourceFile.absolutePath}", e)
+            false
+        }
+    }
+}

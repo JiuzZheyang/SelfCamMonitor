@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">手机监控</string>
+    <!-- 内网穿透 -->
+    <string name="tunnel_none">不启用穿透</string>
+    <string name="tunnel_cloudflared">Cloudflare Tunnel</string>
+    <string name="tunnel_frp">frp 内网穿透</string>
+    <string name="frp_protocol_tcp">TCP（随机端口）</string>
+    <string name="frp_protocol_http">HTTP（需要域名）</string>
+</resources>
