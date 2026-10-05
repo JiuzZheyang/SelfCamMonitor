@@ -6,6 +6,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -414,6 +415,8 @@ class TunnelService : Service() {
     }
 
     private fun createNotificationChannel() {
+        // NotificationChannel 为 API 26+，低版本无此概念，直接跳过
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val channel = NotificationChannel(channelId, "内网穿透服务", NotificationManager.IMPORTANCE_LOW)
             .apply { description = "保持内网穿透后台运行" }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
