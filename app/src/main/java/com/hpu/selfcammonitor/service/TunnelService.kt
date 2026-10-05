@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * applicationInfo.nativeLibraryDir（只读 + 可执行），以此绕开 Android 10+ 禁止从 app
  * 数据目录执行程序（W^X）的限制。
  *
- * cloudflared: 使用 Tunnel Token 认证（`tunnel --token <token>`）。
+ * cloudflared: 使用 Tunnel Token 认证（`tunnel run --token <token>`）。
  * frp:         生成 frpc.ini，支持 TCP（remote_port）与 HTTP（custom_domains）两种代理。
  */
 class TunnelService : Service() {
@@ -186,7 +186,7 @@ class TunnelService : Service() {
                 return@execute
             }
 
-            val cmd = listOf(binary.absolutePath, "--no-autoupdate", "tunnel", "--token", token.trim())
+            val cmd = listOf(binary.absolutePath, "--no-autoupdate", "tunnel", "run", "--token", token.trim())
             Log.d(TAG, "启动 cloudflared: $cmd")
             updateNotification("正在连接 Cloudflare...")
 
