@@ -59,7 +59,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
 
-class CameraService : LifecycleService() {
+class CameraService : LifecycleService(), StreamControl {
 
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var wakeLock: PowerManager.WakeLock
@@ -76,8 +76,8 @@ class CameraService : LifecycleService() {
     private var motionAlertEnabled = false  // 运动报警开关（与检测参数共用，独立于录像模式）
     private var useFrontCamera = false   // 镜头选择：false=后置，true=前置（启动相机时生效）
     private var actualCameraFacing = 0   // 实际绑定的镜头朝向：0=后置，1=前置（回退场景下与配置可能不同）
+    @Volatile
     private var actualResolution = "--"  // 实际绑定的推流分辨率（回退策略下可能与设置值不同）
-
     // 运动触发短视频录制（已验证可行）
 //    private lateinit var videoCapture: VideoCapture<Recorder>
 //    private var recording: Recording? = null
@@ -98,11 +98,24 @@ class CameraService : LifecycleService() {
     @Volatile
     private var isRecording = false
 
+    // ── 网页端手动录像（不受录像模式限制，可随时启停）──
+    @Volatile
+    private var manualRecording = false
+    private var manualRecord: Recording? = null
+    // 需要额外绑定 VideoCapture 才能手动录像（仅预览模式下 videoCapture 为 null）
+    private var manualRecordWanted = false
+
     // 运动录像停止定时器句柄（可取消，防止误停后续新录像）
     private var clipStopRunnable: Runnable? = null
 
     // 运动录像代数计数：使迟到的旧会话 Finalize 事件/定时器不影响新会话状态
     private var clipGeneration = 0
+
+    // 手动录像代数计数（同 clipGeneration 用途，防止旧会话事件影响新会话）
+    private var manualGeneration = 0
+
+    // 分辨率格式校验（如 1280x720）
+    private val resPattern = Regex("^\\d{3,4}x\\d{3,4}$")
 
     // 帧率限制（均匀间隔出帧）
     private var targetFps = 10
@@ -114,6 +127,7 @@ class CameraService : LifecycleService() {
     // 实际帧率统计（在编码完成后计数，反映真正推出去的帧）
     private var frameCount = 0
     private var fpsWindowStart = 0L
+    @Volatile
     private var currentFps = 0
 
     // 只读诊断：区分「分析收到的原始帧」和「编码推送成功帧」
@@ -207,6 +221,7 @@ class CameraService : LifecycleService() {
         mjpegStreamer = MJPEGStreamer()
         streamServer = StreamServer(8080)
         streamServer.setMJPEGStreamer(mjpegStreamer)
+        streamServer.setControl(this)
 
         createNotificationChannel()
         acquireWakeLock()
@@ -396,6 +411,11 @@ class CameraService : LifecycleService() {
         sendStatusBroadcast(false)  // 通知主界面更新状态（原实现停止时无广播，界面一直显示"运行中"）
         stopContinuousRecording()
         stopMotionRecording()
+        // 停止网页端手动录像
+        manualRecording = false
+        manualGeneration++
+        manualRecord?.stop()
+        manualRecord = null
         streamServer.stop()
         cameraProvider?.unbindAll()
         cameraBound = false
@@ -524,7 +544,8 @@ class CameraService : LifecycleService() {
                     nextEmitAt = maxOf(nextEmitAt + (1000L / targetFps), now)
                     val frameStartTs = now  // 用于统计整帧处理耗时
 
-                    // 根据录像模式处理
+                    // 根据录像模式处理（网页端手动录像进行中时跳过，避免与手动会话争用 VideoCapture）
+                    if (!manualRecording) {
                     when (recordMode) {
                         MODE_CONTINUOUS -> {
                             // 连续录像：录像会话因监控时间窗暂停或异常中断时自动恢复
@@ -552,6 +573,7 @@ class CameraService : LifecycleService() {
                             // 不录像、不运动检测
 //                            Log.d(TAG, "不录像、不运动检测")
                         }
+                    }
                     }
                     // MJPEG 推流：只在分析线程做 NV21 拷贝，随后覆盖式投递到编码槽位。
                     // 编码（旋转+JPEG）由单线程编码循环异步完成：分析线程快速返回，
@@ -609,9 +631,10 @@ class CameraService : LifecycleService() {
             try {
                 cameraProvider?.unbindAll()
 
-                // 根据录像模式决定是否绑定 VideoCapture
+                // 根据录像模式决定是否绑定 VideoCapture（网页端手动录像时也需绑定）
                 val useCases = mutableListOf<UseCase>(imageAnalysis)
-                if (recordMode == MODE_CONTINUOUS || recordMode == MODE_MOTION_TRIGGERED) {
+                val needVideo = recordMode == MODE_CONTINUOUS || recordMode == MODE_MOTION_TRIGGERED || manualRecordWanted
+                if (needVideo) {
                     val recorder = Recorder.Builder()
                         .setQualitySelector(QualitySelector.from(Quality.SD))
                         .build()
@@ -651,6 +674,10 @@ class CameraService : LifecycleService() {
                 // 绑定成功后根据模式启动连续录像
                 if (recordMode == MODE_CONTINUOUS) {
                     startContinuousRecording()
+                }
+                // 网页端手动录像等待绑定完成：立即开始（仅预览模式下临时绑定了 VideoCapture）
+                if (manualRecording && manualRecord == null && videoCapture != null) {
+                    startManualRecordInternal()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "相机绑定失败", e)
@@ -749,9 +776,9 @@ class CameraService : LifecycleService() {
 
     // ---- 预览页 HUD 只读状态（同进程 UI 读取，无锁快照语义） ----
 
-    /** 当前是否正在写录像文件（连续分段或运动短片） */
+    /** 当前是否正在写录像文件（连续分段、运动短片或网页手动录像） */
     val hudRecording: Boolean
-        get() = isRecording || continuousRecording
+        get() = isRecording || continuousRecording || manualRecording
 
     /** 录像模式中文标签 */
     val hudModeLabel: String
@@ -764,6 +791,196 @@ class CameraService : LifecycleService() {
     /** 当前是否处于监控时间窗内 */
     val hudWithinWindow: Boolean
         get() = isWithinTimeWindow()
+
+    // ─── StreamControl 实现（网页端控制） ──────────────────────────
+
+    override fun state(): Map<String, Any?> = linkedMapOf(
+        "running" to isRunning,
+        "mjpegEnabled" to mjpegEnabled,
+        "resolution" to actualResolution,
+        "configuredResolution" to (prefs.getString("resolution", "640x480") ?: "640x480"),
+        "fps" to targetFps,
+        "facing" to actualCameraFacing,
+        "configuredFacing" to prefs.getInt("camera_facing", 0),
+        "mode" to recordMode,
+        "modeLabel" to hudModeLabel,
+        "recording" to (isRecording || continuousRecording || manualRecording),
+        "manualRecording" to manualRecording,
+        "clientCount" to mjpegStreamer.getClientCount(),
+        "lastFrameAge" to mjpegStreamer.getLastFrameAge(),
+        "currentFps" to currentFps,
+        "withinWindow" to isWithinTimeWindow(),
+        "resolutions" to supportedResolutions(),
+    )
+
+    override fun supportedResolutions(): List<String> {
+        val out = mutableListOf<String>()
+        try {
+            val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val targetFacing = if (useFrontCamera) {
+                CameraCharacteristics.LENS_FACING_FRONT
+            } else {
+                CameraCharacteristics.LENS_FACING_BACK
+            }
+            val cameraId = cameraManager.cameraIdList.firstOrNull { id ->
+                cameraManager.getCameraCharacteristics(id)
+                    .get(CameraCharacteristics.LENS_FACING) == targetFacing
+            } ?: cameraManager.cameraIdList.firstOrNull()
+            if (cameraId != null) {
+                val map: StreamConfigurationMap? = cameraManager.getCameraCharacteristics(cameraId)
+                    .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                map?.getOutputSizes(ImageFormat.YUV_420_888)?.forEach { size ->
+                    val aspect = size.width.toFloat() / size.height.toFloat()
+                    if (size.width in 320..1920 && size.height >= 240 && aspect in 1.33f..1.78f) {
+                        val label = "${size.width}x${size.height}"
+                        if (label !in out) out.add(label)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "枚举支持分辨率失败", e)
+        }
+        if (out.isEmpty()) out.addAll(listOf("320x240", "640x480", "1280x720", "1920x1080"))
+        // 保证当前配置值在列表中（回退场景下也能选中）
+        val cur = prefs.getString("resolution", "640x480") ?: "640x480"
+        if (cur !in out) out.add(0, cur)
+        return out
+    }
+
+    override fun applyConfig(params: Map<String, String>): Map<String, Any?> {
+        val editor = prefs.edit()
+        var needRebind = false
+        var needModeReload = false
+        val applied = mutableListOf<String>()
+
+        params.forEach { (key, raw) ->
+            val v = raw.trim()
+            when (key) {
+                "resolution" -> if (resPattern.matches(v)) {
+                    editor.putString("resolution", v); needRebind = true; applied.add(key)
+                }
+                "fps" -> v.toIntOrNull()?.let {
+                    editor.putInt("fps", it.coerceIn(1, 30)); needRebind = true; applied.add(key)
+                }
+                "facing" -> v.toIntOrNull()?.let {
+                    editor.putInt("camera_facing", it.coerceIn(0, 1)); needRebind = true; applied.add(key)
+                }
+                "mode" -> v.toIntOrNull()?.let {
+                    editor.putInt("record_mode", it.coerceIn(0, 2)); needModeReload = true; applied.add(key)
+                }
+                "mjpeg" -> {
+                    val enabled = v == "1" || v.equals("true", ignoreCase = true)
+                    editor.putBoolean("mjpeg_enabled", enabled); applied.add(key)
+                }
+            }
+        }
+        editor.apply()
+        loadSettings()
+        streamServer.isMjpegEnabled = mjpegEnabled
+
+        if (needModeReload) {
+            // 模式切换：复用既有热重载广播（内部处理跨仅预览边界的相机重新绑定）
+            val intent = Intent("com.hpu.selfcammonitor.RELOAD_CONFIG")
+            intent.setPackage(packageName)
+            sendBroadcast(intent)
+        }
+        if (needRebind) {
+            // 分辨率/帧率/镜头变更需重新绑定相机；先停掉现有录像会话，再由模式逻辑自动恢复
+            handler.post {
+                stopMotionRecording()
+                stopContinuousRecording()
+                startCamera()
+            }
+        }
+        val result = LinkedHashMap<String, Any?>(state())
+        result["applied"] = applied
+        return result
+    }
+
+    override fun startManualRecording(): Boolean {
+        handler.post { startManualRecordingInternal() }
+        return true
+    }
+
+    override fun stopManualRecording(): Boolean {
+        handler.post {
+            if (!manualRecording && manualRecord == null) return@post
+            manualRecording = false
+            manualGeneration++  // 使旧会话的 Finalize 事件失效
+            manualRecord?.stop()
+            manualRecord = null
+            when {
+                recordMode == MODE_CONTINUOUS -> startContinuousRecording()
+                manualRecordWanted -> {
+                    // 仅预览模式：手动录像结束后重新绑定以解绑 VideoCapture
+                    manualRecordWanted = false
+                    startCamera()
+                }
+            }
+        }
+        return true
+    }
+
+    /** 手动录像：仅预览模式下 videoCapture 为 null，需先重新绑定相机 */
+    private fun startManualRecordingInternal() {
+        if (manualRecording) return
+        if (!isRunning) {
+            Log.w(TAG, "手动录像：服务未运行")
+            return
+        }
+        if (isRecording || continuousRecording) {
+            // 手动录像独占 VideoCapture，先停掉模式化的录像会话
+            stopMotionRecording()
+            stopContinuousRecording()
+        }
+        manualRecording = true
+        if (videoCapture == null) {
+            manualRecordWanted = true
+            startCamera()   // 重新绑定以启用 VideoCapture，绑定完成后自动开始录制
+        } else {
+            startManualRecordInternal()
+        }
+    }
+
+    private fun startManualRecordInternal() {
+        val vc = videoCapture
+        if (vc == null) {
+            Log.w(TAG, "手动录像：videoCapture 为空")
+            return
+        }
+        val dailyDir = getDailyRecordDir()
+        val file = File(dailyDir, "manual_${System.currentTimeMillis()}.mp4")
+        val outputOptions = FileOutputOptions.Builder(file).build()
+        val gen = ++manualGeneration
+        val pending: Recording = vc.output
+            .prepareRecording(this, outputOptions)
+            .apply {
+                if (ActivityCompat.checkSelfPermission(this@CameraService, Manifest.permission.RECORD_AUDIO)
+                    == PackageManager.PERMISSION_GRANTED) {
+                    withAudioEnabled()
+                }
+            }
+            .start(ContextCompat.getMainExecutor(this)) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> Log.d(TAG, "手动录像开始: ${file.name}")
+                    is VideoRecordEvent.Finalize -> {
+                        if (gen == manualGeneration) {
+                            manualRecord = null
+                            if (event.error != 0) {
+                                if (!file.exists() || file.length() < 4096) {
+                                    try { file.delete() } catch (_: Exception) {}
+                                }
+                                Log.e(TAG, "手动录像失败: ${file.name}, error=${event.error}")
+                                notifyRecordError()
+                            } else {
+                                Log.d(TAG, "手动录像完成: ${file.name}")
+                            }
+                        }
+                    }
+                }
+            }
+        manualRecord = pending
+    }
 
     private fun isWithinTimeWindow(): Boolean {
         // 空白值（null 或空字符串）视为无限制，全天监控
@@ -800,6 +1017,7 @@ class CameraService : LifecycleService() {
         // 运动连续触发时可能在事件到达前重复创建录制会话）
         handler.post {
             if (isRecording) return@post
+            if (manualRecording) return@post
             if (!isRunning) return@post
             val vc = videoCapture
             if (vc == null) {
@@ -890,6 +1108,7 @@ class CameraService : LifecycleService() {
      */
     private fun startNewContinuousSegment() {
         if (!continuousRecording) return
+        if (manualRecording) return  // 手动录像进行中，不开启连续分段
         if (currentSegmentRecording != null) return  // 已有分段在录，避免重复创建
         if (!isWithinTimeWindow()) {
             // 非监控时段不开新分段（continuousRecording 标志保留，时段恢复后自动续录）
