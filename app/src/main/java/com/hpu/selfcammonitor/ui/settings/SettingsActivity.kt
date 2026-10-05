@@ -154,6 +154,7 @@ class SettingsActivity : AppCompatActivity() {
                 1 -> { tilCloudflaredToken.visibility = View.VISIBLE; layoutFrpSettings.visibility = View.GONE }
                 2 -> { tilCloudflaredToken.visibility = View.GONE; layoutFrpSettings.visibility = View.VISIBLE }
             }
+            refreshToggleButton()
         }
 
         // frp 协议选项
@@ -166,50 +167,24 @@ class SettingsActivity : AppCompatActivity() {
             tilFrpRemotePort.visibility = if (isHttp) View.GONE else View.VISIBLE
         }
 
-        // 穿透启动/停止按钮
+        // 穿透启动/停止/切换按钮
+        // 运行中的穿透方式与当前选中项一致 → 停止；不一致且选中项有效 → 自动停旧起新（切换）；未运行 → 启动
         btnTunnelToggle.setOnClickListener {
-            val type = when (spinnerTunnelType.text.toString()) {
-                getString(R.string.tunnel_cloudflared) -> "cloudflared"
-                getString(R.string.tunnel_frp) -> "frp"
-                else -> "none"
-            }
-            if (TunnelService.isTunnelRunning()) {
-                TunnelService.stopTunnel(this)
-            } else if (type == "none") {
-                Toast.makeText(this, "请先选择穿透方式并保存", Toast.LENGTH_SHORT).show()
-            } else {
-                if (type == "cloudflared") {
-                    val token = etCloudflaredToken.text.toString().trim()
-                    if (token.isEmpty()) { Toast.makeText(this, "请先填写 Token", Toast.LENGTH_SHORT).show(); return@setOnClickListener }
-                    prefs.edit().putString("tunnel_type", "cloudflared").putString("cloudflared_token", token).apply()
-                    TunnelService.startTunnel(this, "cloudflared", mapOf("cloudflared_token" to token))
-                } else if (type == "frp") {
-                    val server = etFrpServer.text.toString().trim()
-                    if (server.isEmpty()) { Toast.makeText(this, "请先填写 frps 服务器地址", Toast.LENGTH_SHORT).show(); return@setOnClickListener }
-                    val extras = mapOf(
-                        "frp_server" to server,
-                        "frp_server_port" to (etFrpServerPort.text.toString().toIntOrNull() ?: 7000).toString(),
-                        "frp_token" to etFrpToken.text.toString(),
-                        "frp_local_ip" to etFrpLocalIp.text.toString(),
-                        "frp_local_port" to (etFrpLocalPort.text.toString().toIntOrNull() ?: 8080).toString(),
-                        "frp_protocol" to if (spinnerFrpProtocol.text.toString() == getString(R.string.frp_protocol_http)) "http" else "tcp",
-                        "frp_subdomain" to etFrpSubdomain.text.toString(),
-                        "frp_domain" to etFrpDomain.text.toString(),
-                        "frp_remote_port" to (etFrpRemotePort.text.toString().toIntOrNull() ?: 0).toString()
-                    )
-                    prefs.edit()
-                        .putString("tunnel_type", "frp")
-                        .putString("frp_server", server)
-                        .putString("frp_server_port", extras["frp_server_port"])
-                        .putString("frp_token", extras["frp_token"])
-                        .putString("frp_local_ip", extras["frp_local_ip"])
-                        .putString("frp_local_port", extras["frp_local_port"])
-                        .putString("frp_protocol", extras["frp_protocol"])
-                        .putString("frp_subdomain", extras["frp_subdomain"])
-                        .putString("frp_domain", extras["frp_domain"])
-                        .putString("frp_remote_port", extras["frp_remote_port"])
-                        .apply()
-                    TunnelService.startTunnel(this, "frp", extras)
+            val type = selectedTunnelType()
+            val running = TunnelService.isTunnelRunning()
+            val runningType = TunnelService.getTunnelType()
+            when {
+                running && runningType == type -> {
+                    TunnelService.stopTunnel(this)
+                    Toast.makeText(this, "已停止穿透", Toast.LENGTH_SHORT).show()
+                }
+                type == "none" -> Toast.makeText(this, "请先选择穿透方式", Toast.LENGTH_SHORT).show()
+                else -> {
+                    if (running && runningType != type) {
+                        Toast.makeText(this, "正在切换到${if (type == "frp") "frp" else "Cloudflare Tunnel"}...", Toast.LENGTH_SHORT).show()
+                    }
+                    // startTunnel 内部会先 killProcesses() 停掉旧进程，无需手动先停
+                    startSelectedTunnel(type)
                 }
             }
         }
@@ -224,15 +199,14 @@ class SettingsActivity : AppCompatActivity() {
                     tvTunnelStatus.text = url.ifBlank { "运行中" }
                     tvTunnelStatus.setTextColor(getColor(R.color.green))
                     tvTunnelStatus.setBackgroundResource(R.drawable.bg_status_running)
-                    btnTunnelToggle.text = "停止"
                     btnCopyTunnelUrl.visibility = if (url.startsWith("http")) View.VISIBLE else View.GONE
                 } else {
                     tvTunnelStatus.text = if (error.isNotEmpty()) "错误: $error" else "已停止"
                     tvTunnelStatus.setTextColor(getColor(R.color.text_secondary))
                     tvTunnelStatus.setBackgroundResource(R.drawable.bg_status_idle)
-                    btnTunnelToggle.text = "启动"
                     btnCopyTunnelUrl.visibility = View.GONE
                 }
+                refreshToggleButton()
             }
         }
         ContextCompat.registerReceiver(this, tunnelReceiver, IntentFilter("com.hpu.selfcammonitor.TUNNEL_STATUS"), ContextCompat.RECEIVER_NOT_EXPORTED)
@@ -283,6 +257,71 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
         return super.dispatchTouchEvent(ev)
+    }
+
+    /** 当前下拉选中的穿透方式：cloudflared / frp / none */
+    private fun selectedTunnelType(): String = when (spinnerTunnelType.text.toString()) {
+        getString(R.string.tunnel_cloudflared) -> "cloudflared"
+        getString(R.string.tunnel_frp) -> "frp"
+        else -> "none"
+    }
+
+    /**
+     * 根据「选中方式」与「正在运行的方式」刷新按钮文案：
+     * 运行中且一致 -> 停止；运行中但不同 -> 切换；未运行 -> 启动
+     */
+    private fun refreshToggleButton() {
+        val type = selectedTunnelType()
+        val running = TunnelService.isTunnelRunning()
+        val runningType = TunnelService.getTunnelType()
+        btnTunnelToggle.text = when {
+            running && runningType == type -> "停止"
+            running && type != "none" -> "切换"
+            else -> "启动"
+        }
+    }
+
+    /** 收集表单配置、持久化并启动指定方式的穿透（服务端会先停掉旧进程） */
+    private fun startSelectedTunnel(type: String) {
+        if (type == "cloudflared") {
+            val token = etCloudflaredToken.text.toString().trim()
+            if (token.isEmpty()) {
+                Toast.makeText(this, "请先填写 Token", Toast.LENGTH_SHORT).show()
+                return
+            }
+            prefs.edit().putString("tunnel_type", "cloudflared").putString("cloudflared_token", token).apply()
+            TunnelService.startTunnel(this, "cloudflared", mapOf("cloudflared_token" to token))
+        } else if (type == "frp") {
+            val server = etFrpServer.text.toString().trim()
+            if (server.isEmpty()) {
+                Toast.makeText(this, "请先填写 frps 服务器地址", Toast.LENGTH_SHORT).show()
+                return
+            }
+            val extras = mapOf(
+                "frp_server" to server,
+                "frp_server_port" to (etFrpServerPort.text.toString().toIntOrNull() ?: 7000).toString(),
+                "frp_token" to etFrpToken.text.toString(),
+                "frp_local_ip" to etFrpLocalIp.text.toString(),
+                "frp_local_port" to (etFrpLocalPort.text.toString().toIntOrNull() ?: 8080).toString(),
+                "frp_protocol" to if (spinnerFrpProtocol.text.toString() == getString(R.string.frp_protocol_http)) "http" else "tcp",
+                "frp_subdomain" to etFrpSubdomain.text.toString(),
+                "frp_domain" to etFrpDomain.text.toString(),
+                "frp_remote_port" to (etFrpRemotePort.text.toString().toIntOrNull() ?: 0).toString()
+            )
+            prefs.edit()
+                .putString("tunnel_type", "frp")
+                .putString("frp_server", server)
+                .putString("frp_server_port", extras["frp_server_port"])
+                .putString("frp_token", extras["frp_token"])
+                .putString("frp_local_ip", extras["frp_local_ip"])
+                .putString("frp_local_port", extras["frp_local_port"])
+                .putString("frp_protocol", extras["frp_protocol"])
+                .putString("frp_subdomain", extras["frp_subdomain"])
+                .putString("frp_domain", extras["frp_domain"])
+                .putString("frp_remote_port", extras["frp_remote_port"])
+                .apply()
+            TunnelService.startTunnel(this, "frp", extras)
+        }
     }
 
     private fun loadSettings() {
@@ -364,6 +403,7 @@ class SettingsActivity : AppCompatActivity() {
             btnTunnelToggle.text = "启动"
             btnCopyTunnelUrl.visibility = View.GONE
         }
+        refreshToggleButton()
     }
 
     private fun loadSupportedResolutions(cameraFacing: Int) {
