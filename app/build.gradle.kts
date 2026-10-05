@@ -36,9 +36,6 @@ android {
 
     // 内网穿透二进制（cloudflared / frpc）以 lib*.so 形式打包进 jniLibs，
     // 安装时由系统解压到 nativeLibraryDir（只读可执行），绕开 Android 10+ 的 W^X 限制。
-    ndk {
-        abiFilters += "arm64-v8a"
-    }
     packaging {
         jniLibs {
             useLegacyPackaging = true
