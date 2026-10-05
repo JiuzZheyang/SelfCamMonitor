@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * 内网穿透服务：支持 cloudflared (Cloudflare Tunnel) 和 frp 两种模式。
  *
- * 二进制以 jniLibs/*.so 形式打包（libcloudflared.so / libfrpc.so），安装时被系统解压到
+ * 二进制以 jniLibs 下的 lib*.so 形式打包（libcloudflared.so / libfrpc.so），安装时被系统解压到
  * applicationInfo.nativeLibraryDir（只读 + 可执行），以此绕开 Android 10+ 禁止从 app
  * 数据目录执行程序（W^X）的限制。
  *
@@ -308,28 +308,33 @@ class TunnelService : Service() {
             frpcProcess = proc
             isRunning.set(true)
 
-            val displayUrl = if (isHttp) "http://$customDomains" else "$server:${if (remotePort > 0) remotePort else "?"}"
+            val httpUrl = "http://$customDomains"
+            var announced = ""
             var lastErr = ""
-            var connected = false
 
-            fun markConnected() {
-                if (connected) return
-                connected = true
-                tunnelUrl = displayUrl
-                updateNotification("穿透运行中: $tunnelUrl")
-                broadcastStatus(TYPE_FRP, tunnelUrl, true, "")
+            // url 变化时才广播（登录成功 → 拿到真实远程端口可能两次）
+            val announce: (String) -> Unit = { url ->
+                if (url != announced) {
+                    announced = url
+                    tunnelUrl = url
+                    updateNotification("穿透运行中: $url")
+                    broadcastStatus(TYPE_FRP, url, true, "")
+                }
             }
 
             readLogs(proc, "frpc") { line ->
                 if (line.contains("start proxy success", ignoreCase = true) ||
                     (line.contains("login", ignoreCase = true) && line.contains("success", ignoreCase = true))) {
-                    markConnected()
+                    announce(
+                        if (isHttp) httpUrl
+                        else if (remotePort > 0) "$server:$remotePort"
+                        else "$server:?"
+                    )
                 }
                 // frps 分配的远程端口（"remote port = 12345" 之类）
                 val portMatch = Regex("remote[_ ]port\\D{0,4}(\\d{2,5})").find(line)
                 if (portMatch != null && !isHttp) {
-                    tunnelUrl = "$server:${portMatch.groupValues[1]}"
-                    markConnected()
+                    announce("$server:${portMatch.groupValues[1]}")
                 }
                 if (line.contains("err", ignoreCase = true) || line.contains("failed", ignoreCase = true)) lastErr = line
             }
