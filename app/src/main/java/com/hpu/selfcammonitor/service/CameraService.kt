@@ -16,6 +16,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -412,6 +413,8 @@ class CameraService : LifecycleService() {
     }
 
     private fun createNotificationChannel() {
+        // NotificationChannel 为 API 26+，低版本无此概念，直接跳过
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val channel = NotificationChannel(
             CHANNEL_ID,
             "摄像头监控服务",
