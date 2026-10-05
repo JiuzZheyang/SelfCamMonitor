@@ -192,16 +192,32 @@ class TunnelService : Service() {
             }
 
             // Android 沙箱下没有 /etc/resolv.conf，Go 会回退到 127.0.0.1:53/[::1]:53。
-            // 先启动本地 DNS 中继，让 cloudflared 能正常解析 SRV 记录。
+            // 方案一（主）：App 端自己解析 SRV 拿到边缘 IP，用 TUNNEL_EDGE 注入，
+            //   让 cloudflared 不再依赖自身域名解析（实测可直接连上边缘）。
+            // 方案二（备）：启动本地 DNS 中继（在能绑定 53 端口的老版本上仍有效）。
             ensureDnsForwarder()
             val cmd = mutableListOf(binary.absolutePath, "--no-autoupdate", "tunnel", "run", "--token", token.trim())
             Log.d(TAG, "启动 cloudflared: $cmd")
+
+            val edges = try {
+                EdgeDiscovery.discover(systemDnsServers())
+            } catch (e: Exception) {
+                Log.w(TAG, "边缘发现失败: ${e.message}")
+                emptyList()
+            }
             updateNotification("正在连接 Cloudflare...")
 
             val proc = try {
                 ProcessBuilder(cmd)
                     .directory(filesDir)
-                    .apply { environment()["HOME"] = filesDir.absolutePath; redirectErrorStream(true) }
+                    .apply {
+                        environment()["HOME"] = filesDir.absolutePath
+                        if (edges.isNotEmpty()) {
+                            environment()["TUNNEL_EDGE"] = edges.joinToString(",")
+                            Log.i(TAG, "使用显式边缘地址: ${edges.joinToString(",")}")
+                        }
+                        redirectErrorStream(true)
+                    }
                     .start()
             } catch (e: Exception) {
                 Log.e(TAG, "cloudflared 启动失败", e)
