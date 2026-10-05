@@ -4,6 +4,7 @@ import fi.iki.elonen.NanoHTTPD
 import java.io.ByteArrayInputStream
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
+import java.net.URLDecoder
 import android.util.Base64
 import com.hpu.selfcammonitor.utils.MJPEGStreamer
 
@@ -11,20 +12,30 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
 
     private lateinit var mjpegStreamer: MJPEGStreamer
 
-    var isMjpegEnabled: Boolean = true   // 新增状态
+    var isMjpegEnabled: Boolean = true
 
     var username: String? = null
     var password: String? = null
+
+    /** 网页端控制入口（由 CameraService 注入） */
+    @Volatile
+    private var control: StreamControl? = null
 
     fun setMJPEGStreamer(streamer: MJPEGStreamer) {
         this.mjpegStreamer = streamer
     }
 
+    fun setControl(c: StreamControl) {
+        this.control = c
+    }
+
     override fun serve(session: IHTTPSession?): Response {
-        // 增加 username 和 password 属性验证
+        val s = session
+            ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "bad request")
+
         // 认证检查
         if (username != null && password != null) {
-            val auth = session?.headers?.get("authorization")
+            val auth = s.headers["authorization"]
             if (auth == null || !auth.startsWith("Basic ")) {
                 val res = newFixedLengthResponse(
                     Response.Status.UNAUTHORIZED, "text/plain", "需要认证"
@@ -44,60 +55,181 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
             }
         }
 
-        if (session?.uri == "/" || session?.uri == "/index.html") {
-            val res = newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", VIEWER_HTML)
-            res.addHeader("Cache-Control", "no-store")
-            return res
+        return when (s.uri) {
+            "/", "/index.html" -> htmlPage()
+            "/video" -> serveVideo()
+            "/status" -> serveLegacyStatus()
+            "/snapshot" -> serveSnapshot(download = false)
+            "/api/state" -> serveState()
+            "/api/config" -> serveConfig(s)
+            "/api/record" -> serveRecord(s)
+            "/api/snapshot" -> serveSnapshot(download = true)
+            else -> newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 Not Found")
         }
+    }
 
-        if (session?.uri == "/status") {
-            val json = """{"mjpegEnabled":$isMjpegEnabled,"clientCount":${mjpegStreamer.getClientCount()},"lastFrameAge":${mjpegStreamer.getLastFrameAge()}}"""
-            val res = newFixedLengthResponse(Response.Status.OK, "application/json", json)
-            res.addHeader("Cache-Control", "no-store")
-            return res
-        }
+    // ─── 端点实现 ──────────────────────────────────────────────
 
-        if (session?.uri == "/snapshot") {
-            if (!isMjpegEnabled) {
-                return newFixedLengthResponse(
-                    Response.Status.SERVICE_UNAVAILABLE, "text/plain", "推流已关闭"
-                )
-            }
-            val jpeg = mjpegStreamer.getLatestJpeg()
-            if (jpeg == null) {
-                return newFixedLengthResponse(
-                    Response.Status.SERVICE_UNAVAILABLE, "text/plain", "暂无画面"
-                )
-            }
-            val res = newFixedLengthResponse(
-                Response.Status.OK, "image/jpeg", ByteArrayInputStream(jpeg), jpeg.size.toLong()
-            )
-            res.addHeader("Cache-Control", "no-store")
-            return res
-        }
+    private fun htmlPage(): Response {
+        val res = newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", VIEWER_HTML)
+        res.addHeader("Cache-Control", "no-store")
+        return res
+    }
 
-        if (session?.uri == "/video") {
-            // 检查推流开关
-            if (!isMjpegEnabled) {
-                return newFixedLengthResponse(
-                    Response.Status.SERVICE_UNAVAILABLE,
-                    "text/plain",
-                    "MJPEG 推流已关闭，请在 App 中开启。"
-                )
-            }
-
-            val pipedOut = PipedOutputStream()
-            val pipedIn = PipedInputStream(pipedOut)
-
-            mjpegStreamer.addClient(pipedOut)
-
-            return newChunkedResponse(
-                Response.Status.OK,
-                "multipart/x-mixed-replace; boundary=${MJPEGStreamer.Companion.BOUNDARY}",
-                pipedIn
+    private fun serveVideo(): Response {
+        if (!isMjpegEnabled) {
+            return newFixedLengthResponse(
+                Response.Status.SERVICE_UNAVAILABLE, "text/plain", "MJPEG 推流已关闭，请在网页或 App 中开启。"
             )
         }
-        return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 Not Found")
+        val pipedOut = PipedOutputStream()
+        val pipedIn = PipedInputStream(pipedOut)
+        mjpegStreamer.addClient(pipedOut)
+        return newChunkedResponse(
+            Response.Status.OK,
+            "multipart/x-mixed-replace; boundary=${MJPEGStreamer.Companion.BOUNDARY}",
+            pipedIn
+        )
+    }
+
+    private fun serveLegacyStatus(): Response {
+        val json = "{\"mjpegEnabled\":$isMjpegEnabled," +
+                "\"clientCount\":${mjpegStreamer.getClientCount()}," +
+                "\"lastFrameAge\":${mjpegStreamer.getLastFrameAge()}}"
+        return jsonResponse(json)
+    }
+
+    private fun serveState(): Response {
+        val ctrl = control
+            ?: return jsonResponse("{\"error\":\"服务未就绪\"}")
+        return try {
+            jsonResponse(toJson(ctrl.state()))
+        } catch (e: Exception) {
+            jsonResponse("{\"error\":\"${jsonEscape(e.message ?: "state error")}\"}")
+        }
+    }
+
+    private fun serveConfig(session: IHTTPSession): Response {
+        val ctrl = control
+            ?: return jsonResponse("{\"error\":\"服务未就绪\"}")
+        return try {
+            val params = readParams(session)
+            if (params.isEmpty()) jsonResponse(toJson(ctrl.state()))
+            else jsonResponse(toJson(ctrl.applyConfig(params)))
+        } catch (e: Exception) {
+            jsonResponse("{\"error\":\"${jsonEscape(e.message ?: "config error")}\"}")
+        }
+    }
+
+    private fun serveRecord(session: IHTTPSession): Response {
+        val ctrl = control
+            ?: return jsonResponse("{\"error\":\"服务未就绪\"}")
+        return try {
+            val params = readParams(session)
+            val ok = when (params["action"]) {
+                "start" -> ctrl.startManualRecording()
+                "stop" -> ctrl.stopManualRecording()
+                else -> false
+            }
+            val result = LinkedHashMap<String, Any?>(ctrl.state())
+            result["ok"] = ok
+            jsonResponse(toJson(result))
+        } catch (e: Exception) {
+            jsonResponse("{\"error\":\"${jsonEscape(e.message ?: "record error")}\"}")
+        }
+    }
+
+    private fun serveSnapshot(download: Boolean): Response {
+        if (!isMjpegEnabled) {
+            return newFixedLengthResponse(
+                Response.Status.SERVICE_UNAVAILABLE, "text/plain", "推流已关闭"
+            )
+        }
+        val jpeg = mjpegStreamer.getLatestJpeg()
+            ?: return newFixedLengthResponse(
+                Response.Status.SERVICE_UNAVAILABLE, "text/plain", "暂无画面"
+            )
+        val res = newFixedLengthResponse(
+            Response.Status.OK, "image/jpeg", ByteArrayInputStream(jpeg), jpeg.size.toLong()
+        )
+        if (download) {
+            res.addHeader("Content-Disposition", "attachment; filename=\"snapshot_${System.currentTimeMillis()}.jpg\"")
+        }
+        res.addHeader("Cache-Control", "no-store")
+        return res
+    }
+
+    // ─── 工具 ─────────────────────────────────────────────────
+
+    private fun readParams(session: IHTTPSession): Map<String, String> {
+        val out = LinkedHashMap<String, String>()
+        fun feed(query: String?) {
+            if (query.isNullOrBlank()) return
+            for (pair in query.split("&")) {
+                if (pair.isEmpty()) continue
+                val i = pair.indexOf('=')
+                val k = if (i < 0) pair else pair.substring(0, i)
+                val v = if (i < 0) "" else pair.substring(i + 1)
+                out[urlDecode(k)] = urlDecode(v)
+            }
+        }
+        feed(session.queryParameterString)
+        if (session.method == Method.POST) {
+            try {
+                val body = HashMap<String, String>()
+                session.parseBody(body)
+                feed(body["postData"])
+            } catch (_: Exception) {
+            }
+        }
+        return out
+    }
+
+    private fun urlDecode(v: String): String = try {
+        URLDecoder.decode(v, "UTF-8")
+    } catch (_: Exception) {
+        v
+    }
+
+    private fun jsonResponse(body: String): Response {
+        val res = newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", body)
+        res.addHeader("Cache-Control", "no-store")
+        return res
+    }
+
+    private fun jsonEscape(s: String): String = buildString {
+        for (c in s) {
+            when (c) {
+                '"' -> append("\\\"")
+                '\\' -> append("\\\\")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                else -> if (c < ' ') append("\\u%04x".format(c.code)) else append(c)
+            }
+        }
+    }
+
+    /** 极简 JSON 序列化：支持 Map<String,Any?>，值类型为 String/Number/Boolean/List<*> */
+    private fun toJson(map: Map<String, Any?>): String = buildString {
+        append("{")
+        var first = true
+        for ((k, v) in map) {
+            if (!first) append(",")
+            first = false
+            append("\"").append(jsonEscape(k)).append("\":")
+            when (v) {
+                null -> append("null")
+                is Number, is Boolean -> append(v.toString())
+                is List<*> -> {
+                    append("[")
+                    append(v.joinToString(",") { "\"" + jsonEscape(it.toString()) + "\"" })
+                    append("]")
+                }
+                else -> append("\"").append(jsonEscape(v.toString())).append("\"")
+            }
+        }
+        append("}")
     }
 
     companion object {
@@ -106,83 +238,127 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-<title>SelfCamMonitor</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1216">
+<title>SelfCamMonitor 监控</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-html,body{height:100%;background:#1a1a1a;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow:hidden}
-body{display:flex;flex-direction:column}
-#topbar{display:flex;align-items:center;padding:8px 12px;background:#2a2a2a;gap:8px;flex-shrink:0}
-#dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
-#dot.connecting{background:#ffc107;animation:pulse 1s infinite}
-#dot.live{background:#28a745}
-#dot.disconnected{background:#dc3545;animation:pulse 1s infinite}
-#dot.off{background:#6c757d}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-#st{font-size:14px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#fps{font-size:12px;color:#888;flex-shrink:0;min-width:40px;text-align:right}
-.btn{background:#3a3a3a;color:#e0e0e0;border:1px solid #555;border-radius:6px;padding:6px 12px;font-size:13px;cursor:pointer;flex-shrink:0;touch-action:manipulation;white-space:nowrap}
-.btn:active{background:#4a4a4a}
-#container{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative;min-height:0;touch-action:none}
-#wrapper{position:relative;transform-origin:center center;transition:none;display:flex;align-items:center;justify-content:center;will-change:transform}
+:root{--bg:#0f1216;--card:#161b22;--card2:#1e242d;--line:#2a323d;--fg:#e6ebf2;--mut:#8b97a7;--acc:#3b82f6;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;display:flex;flex-direction:column;overflow:hidden}
+header{display:flex;align-items:center;gap:10px;padding:10px 14px;background:linear-gradient(180deg,#1a212b,#141920);border-bottom:1px solid var(--line);flex-shrink:0}
+.brand{display:flex;align-items:center;gap:8px;font-weight:600;font-size:15px;flex:1;min-width:0}
+.brand span.t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--mut);flex-shrink:0}
+.dot.live{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.dot.connecting{background:var(--warn);animation:pulse 1.2s infinite}
+.dot.disconnected{background:var(--err);animation:pulse 1.2s infinite}
+.dot.off{background:var(--mut)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.badges{display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end}
+.badge{font-size:11px;color:var(--mut);background:var(--card2);border:1px solid var(--line);border-radius:999px;padding:3px 9px;white-space:nowrap}
+.badge.rec{color:#fff;background:var(--err);border-color:var(--err);animation:pulse 1.2s infinite}
+main{flex:1;display:flex;flex-direction:column;min-height:0}
+#viewer{position:relative;flex:1;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000;touch-action:none}
+#wrapper{position:relative;display:flex;align-items:center;justify-content:center;transform-origin:center center;will-change:transform}
 #img{display:block;max-width:100%;max-height:100%;object-fit:contain;-webkit-user-drag:none;user-select:none}
 #cv{display:none;max-width:100%;max-height:100%;-webkit-user-drag:none;user-select:none}
-#overlay{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:#666;font-size:16px;display:none}
+#overlay{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:#7c8798;font-size:15px;display:none;z-index:5}
 #overlay.show{display:block}
-#bottombar{padding:6px 12px;background:#2a2a2a;font-size:12px;color:#888;flex-shrink:0;display:flex;justify-content:space-between}
-#fs-ctrl{display:none;position:fixed;top:10px;right:10px;gap:8px;z-index:100}
-:fullscreen #topbar,:fullscreen #bottombar{display:none}
-:fullscreen #container{height:100vh}
-:fullscreen #fs-ctrl{display:flex}
-:-webkit-full-screen #topbar,:-webkit-full-screen #bottombar{display:none}
-:-webkit-full-screen #container{height:100vh}
-:-webkit-full-screen #fs-ctrl{display:flex}
+.vtoolbar{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);display:flex;gap:8px;z-index:6}
+.iconbtn{width:44px;height:44px;border-radius:50%;border:1px solid rgba(255,255,255,.18);background:rgba(20,25,32,.72);color:#e6ebf2;font-size:17px;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px);touch-action:manipulation}
+.iconbtn:active{background:rgba(59,130,246,.85)}
+.iconbtn.rec.on{background:var(--err);border-color:var(--err)}
+#panel{flex-shrink:0;background:var(--card);border-top:1px solid var(--line);padding:12px 14px;display:flex;flex-direction:column;gap:12px;max-height:46vh;overflow-y:auto}
+.prow{display:flex;align-items:center;gap:10px}
+.prow label.k{width:64px;flex-shrink:0;font-size:13px;color:var(--mut)}
+select,input[type=range]{flex:1;min-width:0;background:var(--card2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:14px;outline:none}
+input[type=range]{padding:0;height:28px;background:transparent;border:none}
+.val{min-width:56px;text-align:right;font-size:13px;color:var(--mut);flex-shrink:0}
+.switch{position:relative;width:46px;height:26px;flex-shrink:0}
+.switch input{opacity:0;width:0;height:0}
+.switch span{position:absolute;inset:0;background:var(--card2);border:1px solid var(--line);border-radius:999px;transition:.2s}
+.switch span:before{content:"";position:absolute;width:18px;height:18px;left:3px;top:2px;background:var(--mut);border-radius:50%;transition:.2s}
+.switch input:checked+span{background:var(--acc);border-color:var(--acc)}
+.switch input:checked+span:before{transform:translateX(20px);background:#fff}
+.pbtns{display:flex;gap:10px}
+.btn{flex:1;padding:12px 10px;border-radius:10px;border:1px solid var(--line);background:var(--card2);color:var(--fg);font-size:14px;cursor:pointer;touch-action:manipulation}
+.btn:active{filter:brightness(1.15)}
+.btn.rec{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+.btn.rec.on{background:var(--err);border-color:var(--err)}
+.pinfo{font-size:12px;color:var(--mut);line-height:1.6}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);background:rgba(20,25,32,.95);color:#fff;border:1px solid var(--line);padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:.25s;z-index:50;max-width:80vw;text-align:center}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+@media(min-width:900px){
+main{flex-direction:row}
+#panel{width:340px;max-height:none;border-top:none;border-left:1px solid var(--line)}
+.brand{font-size:16px}
+}
+:fullscreen #panel,:fullscreen header{display:none}
+:fullscreen #viewer{height:100vh}
+:-webkit-full-screen #panel,:-webkit-full-screen header{display:none}
+:-webkit-full-screen #viewer{height:100vh}
 </style>
 </head>
 <body>
-<div id="topbar">
-<div id="dot" class="connecting"></div>
-<span id="st">连接中...</span>
-<span id="fps"></span>
-<button id="btn-r" class="btn">旋转</button>
-<button id="btn-f" class="btn">全屏</button>
+<header>
+<div class="brand"><span class="dot connecting" id="dot"></span><span class="t" id="title">SelfCamMonitor</span></div>
+<div class="badges">
+<span class="badge" id="b-fps">-- fps</span>
+<span class="badge" id="b-res">--</span>
+<span class="badge" id="b-face">--</span>
+<span class="badge rec" id="b-rec" style="display:none">录制中</span>
 </div>
-<div id="container">
+</header>
+<main>
+<div id="viewer">
 <div id="wrapper"><canvas id="cv"></canvas><img id="img" decoding="async" alt="监控画面"></div>
 <div id="overlay"></div>
+<div class="vtoolbar">
+<button class="iconbtn" id="btn-r" title="旋转">&#8635;</button>
+<button class="iconbtn" id="btn-shot" title="截图">&#128247;</button>
+<button class="iconbtn rec" id="btn-rec" title="录像">&#9679;</button>
+<button class="iconbtn" id="btn-fs" title="全屏">&#9974;</button>
 </div>
-<div id="bottombar">
-<span id="ic"></span>
-<span id="it"></span>
 </div>
-<div id="fs-ctrl">
-<button class="btn" onclick="doRotate()">旋转</button>
-<button class="btn" onclick="toggleFs()">退出全屏</button>
-</div>
+<aside id="panel">
+<div class="prow"><label class="k">分辨率</label><select id="sel-res"></select></div>
+<div class="prow"><label class="k">帧率</label><input id="rng-fps" type="range" min="1" max="30" step="1" value="16"><span class="val" id="lbl-fps">16 fps</span></div>
+<div class="prow"><label class="k">摄像头</label><select id="sel-face"><option value="0">后置</option><option value="1">前置</option></select></div>
+<div class="prow"><label class="k">推流</label><label class="switch"><input id="sw-mjpeg" type="checkbox"><span></span></label><span class="val" id="lbl-mjpeg">开启</span></div>
+<div class="prow"><label class="k">录像模式</label><select id="sel-mode"><option value="2">仅预览</option><option value="0">连续录像</option><option value="1">运动触发</option></select></div>
+<div class="pinfo" id="pinfo"></div>
+</aside>
+</main>
+<div id="toast"></div>
 <script>
 var img=document.getElementById('img'),wrapper=document.getElementById('wrapper'),
 cv=document.getElementById('cv'),ctx=(function(){try{return cv.getContext('2d')}catch(e){return null}})(),
 dispEl=img,useBmp=false,
-dot=document.getElementById('dot'),st=document.getElementById('st'),
-fps=document.getElementById('fps'),ov=document.getElementById('overlay'),
-ic=document.getElementById('ic'),it=document.getElementById('it'),
-container=document.getElementById('container');
+dot=document.getElementById('dot'),ov=document.getElementById('overlay'),
+viewer=document.getElementById('viewer');
+var selRes=document.getElementById('sel-res'),rngFps=document.getElementById('rng-fps'),
+lblFps=document.getElementById('lbl-fps'),selFace=document.getElementById('sel-face'),
+swMjpeg=document.getElementById('sw-mjpeg'),lblMjpeg=document.getElementById('lbl-mjpeg'),
+selMode=document.getElementById('sel-mode'),btnRec=document.getElementById('btn-rec'),
+bFps=document.getElementById('b-fps'),bRes=document.getElementById('b-res'),
+bFace=document.getElementById('b-face'),bRec=document.getElementById('b-rec'),
+pinfo=document.getElementById('pinfo'),toastEl=document.getElementById('toast');
 var HI=3000,ST=5000;
 var rot=0,zoom=1,panX=0,panY=0,fc=0,lf=0,stat='connecting',bu=null;
 var streamReader=null,streamActive=false,streamGen=0,reconnectTimer=null;
+var resFilled=false,userRec=false;
 function setStatus(s){
-  stat=s;dot.className=s;
+  stat=s;dot.className='dot '+s;
   var t={connecting:'连接中...',live:'已连接',disconnected:'已断开，正在重连...',off:'推流已关闭'};
-  st.textContent=t[s]||s;
   if(s==='disconnected'||s==='off'){ov.textContent=t[s];ov.classList.add('show');}
   else ov.classList.remove('show');
 }
-// 优先走 createImageBitmap+canvas：JPEG 解码移出主线程，低端查看设备掉帧更少；
-// 不支持时回退 img.src（decoding=async 避免解码阻塞渲染一帧）
-if(window.createImageBitmap&&ctx){
-  useBmp=true;dispEl=cv;
-  cv.style.display='block';img.style.display='none';
+function toast(msg){
+  toastEl.textContent=msg;toastEl.classList.add('show');
+  clearTimeout(toastEl._t);toastEl._t=setTimeout(function(){toastEl.classList.remove('show');},1800);
 }
+if(window.createImageBitmap&&ctx){useBmp=true;dispEl=cv;cv.style.display='block';img.style.display='none';}
 var dfChain=Promise.resolve();
 function drawFrame(d){
   var blob=new Blob([d],{type:'image/jpeg'});
@@ -203,11 +379,9 @@ function displayFrame(d){
   if(d.length<100)return;
   lf=Date.now();fc++;
   if(stat!=='live')setStatus('live');
-  // 串行链：createImageBitmap 异步完成顺序不保证，必须按帧序排队绘制，否则画面会回跳
   dfChain=dfChain.then(function(){return drawFrame(d);}).catch(function(){});
 }
 function findM(a,m,f){for(var i=f;i<a.length-1;i++)if(a[i]===0xFF&&a[i+1]===m)return i;return -1;}
-// 帧解析位置记忆：SOI 已找到时不再重扫，EOI 从上次末尾续扫（标记可能跨网络分块）
 var soiCached=-1,eoiFrom=-1;
 async function startStream(){
   if(streamActive)return;streamActive=true;
@@ -229,7 +403,7 @@ async function startStream(){
         var eoi=findM(buf,0xD9,Math.max(soi+2,eoiFrom));
         if(eoi<0){
           if(soi>0)buf=buf.slice(soi);
-          soiCached=0;eoiFrom=buf.length-1;  // -1：FF D9 标记可能跨分块，末尾重叠加一
+          soiCached=0;eoiFrom=buf.length-1;
           break;
         }
         displayFrame(buf.slice(soi,eoi+2));
@@ -253,11 +427,62 @@ function scheduleReconnect(){
   if(reconnectTimer)clearTimeout(reconnectTimer);
   reconnectTimer=setTimeout(function(){reconnectTimer=null;if(stat!=='off'&&!streamActive){setStatus('connecting');startStream();}},2000);
 }
+function api(path){return fetch(path,{cache:'no-store'}).then(function(r){return r.json();});}
+function refresh(d){
+  if(!d||d.error)return;
+  bFps.textContent=(d.currentFps||0)+' fps';
+  bRes.textContent=d.resolution||'--';
+  bFace.textContent=(d.facing===1?'前置':'后置');
+  if(!resFilled&&d.resolutions&&d.resolutions.length){
+    resFilled=true;
+    d.resolutions.forEach(function(r){var o=document.createElement('option');o.value=r;o.textContent=r;selRes.appendChild(o);});
+  }
+  if(d.configuredResolution)selRes.value=d.configuredResolution;
+  if(typeof d.fps==='number'){rngFps.value=d.fps;lblFps.textContent=d.fps+' fps';}
+  selFace.value=String(d.facing);
+  swMjpeg.checked=!!d.mjpegEnabled;
+  lblMjpeg.textContent=d.mjpegEnabled?'开启':'关闭';
+  selMode.value=String(d.mode);
+  userRec=!!d.manualRecording;
+  btnRec.classList.toggle('on',userRec);
+  btnRec.innerHTML=userRec?'&#9632;':'&#9679;';
+  bRec.style.display=(d.manualRecording||d.recording)?'':'none';
+  var parts=[];
+  parts.push('模式: '+(d.modeLabel||'--'));
+  if(typeof d.clientCount==='number')parts.push('观看: '+d.clientCount);
+  if(typeof d.lastFrameAge==='number'&&d.lastFrameAge<900000)parts.push('画面延迟: '+d.lastFrameAge+'ms');
+  pinfo.textContent=parts.join('  ·  ');
+}
+function loadState(){
+  api('/api/state').then(function(d){
+    refresh(d);
+    if(d&&d.mjpegEnabled===false&&stat!=='off'){setStatus('off');stopStream();}
+    else if(d&&d.mjpegEnabled&&stat==='off'){setStatus('connecting');startStream();}
+  }).catch(function(){});
+}
+function applyConfig(params,msg){
+  var qs=Object.keys(params).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(params[k]);}).join('&');
+  api('/api/config?'+qs).then(function(d){
+    if(d.error){toast('失败: '+d.error);return;}
+    refresh(d);toast(msg||'已应用');
+  }).catch(function(){toast('设置失败');});
+}
+function toggleRec(){
+  var action=userRec?'stop':'start';
+  api('/api/record?action='+action).then(function(d){
+    if(d.error){toast('失败: '+d.error);return;}
+    refresh(d);toast(action==='start'?'开始录制':'已停止录制');
+  }).catch(function(){toast('操作失败');});
+}
+function snapshot(){
+  var a=document.createElement('a');
+  a.href='/api/snapshot?t='+Date.now();a.download='snapshot.jpg';
+  document.body.appendChild(a);a.click();a.remove();toast('已保存截图');
+}
 function heartbeat(){
-  fetch('/status',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
-    if(!d.mjpegEnabled){setStatus('off');stopStream();return;}
-    ic.textContent='客户端：'+d.clientCount;
-    it.textContent=new Date().toLocaleTimeString();
+  api('/api/state').then(function(d){
+    refresh(d);
+    if(d&&d.mjpegEnabled===false){if(stat!=='off'){setStatus('off');stopStream();}return;}
     if(stat==='off'){setStatus('connecting');startStream();}
   }).catch(function(){
     if(stat!=='off'&&stat!=='disconnected')setStatus('disconnected');
@@ -265,7 +490,7 @@ function heartbeat(){
 }
 setInterval(function(){
   var z=zoom>1.01?(Math.round(zoom*10)/10)+'x':'';
-  if(stat==='live'&&fc>0)fps.textContent=z?z+' · '+fc+' fps':fc+' fps';else fps.textContent=z;
+  if(stat==='live'&&fc>0)bFps.textContent=z?z+' · '+fc+' fps':fc+' fps';
   fc=0;
 },1000);
 setInterval(function(){
@@ -273,10 +498,8 @@ setInterval(function(){
 },2000);
 function applyTransform(){
   wrapper.style.transform='translate('+panX+'px,'+panY+'px) rotate('+rot+'deg) scale('+zoom+')';
-  if(rot===90||rot===270){
-    dispEl.style.maxWidth=container.clientHeight+'px';
-    dispEl.style.maxHeight=container.clientWidth+'px';
-  }else{dispEl.style.maxWidth='100%';dispEl.style.maxHeight='100%';}
+  if(rot===90||rot===270){dispEl.style.maxWidth=viewer.clientHeight+'px';dispEl.style.maxHeight=viewer.clientWidth+'px';}
+  else{dispEl.style.maxWidth='100%';dispEl.style.maxHeight='100%';}
 }
 function doRotate(){
   wrapper.style.transition='transform .3s ease';
@@ -287,37 +510,52 @@ var MIN_Z=1,MAX_Z=5;
 function clampZ(v){return Math.max(MIN_Z,Math.min(MAX_Z,v));}
 function getDist(t){var dx=t[0].clientX-t[1].clientX,dy=t[0].clientY-t[1].clientY;return Math.sqrt(dx*dx+dy*dy);}
 var touching=false,tx=0,ty=0,pinching=false,pd=0,pz=1,lastTap=0;
-container.addEventListener('touchstart',function(e){
+viewer.addEventListener('touchstart',function(e){
   if(e.touches.length===2){pinching=true;touching=false;pd=getDist(e.touches);pz=zoom;e.preventDefault();}
   else if(e.touches.length===1&&zoom>1){touching=true;tx=e.touches[0].clientX;ty=e.touches[0].clientY;}
 },{passive:false});
-container.addEventListener('touchmove',function(e){
+viewer.addEventListener('touchmove',function(e){
   if(pinching&&e.touches.length===2){e.preventDefault();zoom=clampZ(pz*getDist(e.touches)/pd);if(zoom<=1.01){zoom=1;panX=0;panY=0;}applyTransform();}
   else if(touching&&e.touches.length===1){e.preventDefault();panX+=e.touches[0].clientX-tx;panY+=e.touches[0].clientY-ty;tx=e.touches[0].clientX;ty=e.touches[0].clientY;applyTransform();}
 },{passive:false});
-container.addEventListener('touchend',function(e){
+viewer.addEventListener('touchend',function(e){
   if(e.touches.length<2)pinching=false;
   if(e.touches.length===1&&zoom>1){touching=true;tx=e.touches[0].clientX;ty=e.touches[0].clientY;}
   else if(e.touches.length===0){touching=false;var now=Date.now();if(now-lastTap<300){if(zoom>1.01){zoom=1;panX=0;panY=0;}else{zoom=2;}applyTransform();}lastTap=now;}
 });
-container.addEventListener('touchcancel',function(){pinching=false;touching=false;});
-container.addEventListener('wheel',function(e){e.preventDefault();zoom=clampZ(zoom*(e.deltaY<0?1.1:0.9));if(zoom<=1.01){zoom=1;panX=0;panY=0;}applyTransform();},{passive:false});
+viewer.addEventListener('touchcancel',function(){pinching=false;touching=false;});
+viewer.addEventListener('wheel',function(e){e.preventDefault();zoom=clampZ(zoom*(e.deltaY<0?1.1:0.9));if(zoom<=1.01){zoom=1;panX=0;panY=0;}applyTransform();},{passive:false});
 var mousing=false,mx=0,my=0;
-container.addEventListener('mousedown',function(e){if(zoom>1){mousing=true;mx=e.clientX;my=e.clientY;e.preventDefault();}});
+viewer.addEventListener('mousedown',function(e){if(zoom>1){mousing=true;mx=e.clientX;my=e.clientY;e.preventDefault();}});
 window.addEventListener('mousemove',function(e){if(mousing){panX+=e.clientX-mx;panY+=e.clientY-my;mx=e.clientX;my=e.clientY;applyTransform();}});
 window.addEventListener('mouseup',function(){mousing=false;});
-container.addEventListener('dblclick',function(){if(zoom>1.01){zoom=1;panX=0;panY=0;}else{zoom=2;}applyTransform();});
+viewer.addEventListener('dblclick',function(){if(zoom>1.01){zoom=1;panX=0;panY=0;}else{zoom=2;}applyTransform();});
 function toggleFs(){
   var e=document.documentElement,fs=document.fullscreenElement||document.webkitFullscreenElement;
   if(!fs){if(e.requestFullscreen)e.requestFullscreen();else if(e.webkitRequestFullscreen)e.webkitRequestFullscreen();}
   else{if(document.exitFullscreen)document.exitFullscreen();else if(document.webkitExitFullscreen)document.webkitExitFullscreen();}
 }
 document.getElementById('btn-r').addEventListener('click',doRotate);
-document.getElementById('btn-f').addEventListener('click',toggleFs);
+document.getElementById('btn-fs').addEventListener('click',toggleFs);
+document.getElementById('btn-shot').addEventListener('click',snapshot);
+btnRec.addEventListener('click',toggleRec);
+selRes.addEventListener('change',function(){applyConfig({resolution:selRes.value},'分辨率将重启相机生效');});
+selFace.addEventListener('change',function(){resFilled=false;selRes.innerHTML='';applyConfig({facing:selFace.value},'已切换摄像头');});
+selMode.addEventListener('change',function(){applyConfig({mode:selMode.value},'已切换录像模式');});
+var fpsTimer=null;
+rngFps.addEventListener('input',function(){lblFps.textContent=rngFps.value+' fps';});
+rngFps.addEventListener('change',function(){
+  clearTimeout(fpsTimer);
+  fpsTimer=setTimeout(function(){applyConfig({fps:rngFps.value},'帧率已设为 '+rngFps.value);},350);
+});
+swMjpeg.addEventListener('change',function(){
+  applyConfig({mjpeg:swMjpeg.checked?'1':'0'},swMjpeg.checked?'已开启推流':'已关闭推流');
+});
 window.addEventListener('resize',applyTransform);
 document.addEventListener('fullscreenchange',applyTransform);
 document.addEventListener('webkitfullscreenchange',applyTransform);
 setStatus('connecting');startStream();
+loadState();
 setInterval(heartbeat,HI);heartbeat();
 </script>
 </body>
