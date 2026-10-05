@@ -446,7 +446,8 @@ class TunnelService : Service() {
         stopDnsForwarder()
         currentTunnelType = TYPE_NONE
         tunnelUrl = ""
-        broadcastStatus(TYPE_NONE, "", false, "已停止")
+        // 主动停止不是错误：error 传空串，界面会显示“已停止”而非“错误: 已停止”
+        broadcastStatus(TYPE_NONE, "", false, "")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
