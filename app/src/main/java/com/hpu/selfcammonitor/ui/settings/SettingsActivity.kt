@@ -67,6 +67,8 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var etFrpDomain: TextInputEditText
     private lateinit var tilFrpSubdomain: TextInputLayout
     private lateinit var etFrpSubdomain: TextInputEditText
+    private lateinit var tilFrpRemotePort: TextInputLayout
+    private lateinit var etFrpRemotePort: TextInputEditText
     private lateinit var tvTunnelStatus: TextView
     private lateinit var btnTunnelToggle: MaterialButton
     private lateinit var btnCopyTunnelUrl: MaterialButton
@@ -133,6 +135,8 @@ class SettingsActivity : AppCompatActivity() {
         etFrpDomain = findViewById(R.id.etFrpDomain)
         tilFrpSubdomain = findViewById(R.id.tilFrpSubdomain)
         etFrpSubdomain = findViewById(R.id.etFrpSubdomain)
+        tilFrpRemotePort = findViewById(R.id.tilFrpRemotePort)
+        etFrpRemotePort = findViewById(R.id.etFrpRemotePort)
         tvTunnelStatus = findViewById(R.id.tvTunnelStatus)
         btnTunnelToggle = findViewById(R.id.btnTunnelToggle)
         btnCopyTunnelUrl = findViewById(R.id.btnCopyTunnelUrl)
@@ -159,6 +163,7 @@ class SettingsActivity : AppCompatActivity() {
             val isHttp = position == 1
             tilFrpDomain.visibility = if (isHttp) View.VISIBLE else View.GONE
             tilFrpSubdomain.visibility = if (isHttp) View.VISIBLE else View.GONE
+            tilFrpRemotePort.visibility = if (isHttp) View.GONE else View.VISIBLE
         }
 
         // 穿透启动/停止按钮
@@ -189,7 +194,8 @@ class SettingsActivity : AppCompatActivity() {
                         "frp_local_port" to (etFrpLocalPort.text.toString().toIntOrNull() ?: 8080).toString(),
                         "frp_protocol" to if (spinnerFrpProtocol.text.toString() == getString(R.string.frp_protocol_http)) "http" else "tcp",
                         "frp_subdomain" to etFrpSubdomain.text.toString(),
-                        "frp_domain" to etFrpDomain.text.toString()
+                        "frp_domain" to etFrpDomain.text.toString(),
+                        "frp_remote_port" to (etFrpRemotePort.text.toString().toIntOrNull() ?: 0).toString()
                     )
                     prefs.edit()
                         .putString("tunnel_type", "frp")
@@ -201,6 +207,7 @@ class SettingsActivity : AppCompatActivity() {
                         .putString("frp_protocol", extras["frp_protocol"])
                         .putString("frp_subdomain", extras["frp_subdomain"])
                         .putString("frp_domain", extras["frp_domain"])
+                        .putString("frp_remote_port", extras["frp_remote_port"])
                         .apply()
                     TunnelService.startTunnel(this, "frp", extras)
                 }
@@ -333,12 +340,14 @@ class SettingsActivity : AppCompatActivity() {
         etFrpLocalPort.setText(prefs.getString("frp_local_port", "8080"))
         etFrpSubdomain.setText(prefs.getString("frp_subdomain", ""))
         etFrpDomain.setText(prefs.getString("frp_domain", ""))
+        etFrpRemotePort.setText(prefs.getString("frp_remote_port", "0"))
         val frpProto = prefs.getString("frp_protocol", "tcp") ?: "tcp"
         spinnerFrpProtocol.setText(
             if (frpProto == "http") getString(R.string.frp_protocol_http) else getString(R.string.frp_protocol_tcp), false
         )
         tilFrpDomain.visibility = if (frpProto == "http") View.VISIBLE else View.GONE
         tilFrpSubdomain.visibility = if (frpProto == "http") View.VISIBLE else View.GONE
+        tilFrpRemotePort.visibility = if (frpProto == "http") View.GONE else View.VISIBLE
 
         // 根据服务实际运行状态刷新穿透状态显示
         if (TunnelService.isTunnelRunning()) {
@@ -552,6 +561,7 @@ class SettingsActivity : AppCompatActivity() {
             .putString("frp_subdomain", etFrpSubdomain.text.toString().trim())
             .putString("frp_domain", etFrpDomain.text.toString().trim())
             .putString("frp_protocol", frpProtocol)
+            .putString("frp_remote_port", etFrpRemotePort.text.toString().trim().ifEmpty { "0" })
             .putString("resolution", resolution)   // 保存纯字符串
             .putInt("camera_facing", cameraFacing)  // 镜头：0=后置，1=前置
             .putInt("fps", seekBarFps.progress)
