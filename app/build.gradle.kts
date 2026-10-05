@@ -12,10 +12,10 @@ android {
 
     defaultConfig {
         applicationId = "com.hpu.selfcammonitor"
-        minSdk = 26
+        minSdk = 25
         targetSdk = 36
-        versionCode = 1
-        versionName = "2.2.0"
+        versionCode = 2
+        versionName = "2.2.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
