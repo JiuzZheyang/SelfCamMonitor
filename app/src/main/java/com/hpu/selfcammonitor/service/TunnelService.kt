@@ -6,6 +6,8 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -186,7 +188,14 @@ class TunnelService : Service() {
                 return@execute
             }
 
-            val cmd = listOf(binary.absolutePath, "--no-autoupdate", "tunnel", "run", "--token", token.trim())
+            // Android 沙箱下没有可用的 /etc/resolv.conf，Go 会回退到 127.0.0.1:53/[::1]:53
+            // 导致 SRV 查询 connection refused。手动把系统 DNS 传给 cloudflared。
+            val dnsAddrs = systemDnsServers()
+            val cmd = mutableListOf(binary.absolutePath, "--no-autoupdate", "tunnel", "run", "--token", token.trim())
+            if (dnsAddrs.isNotEmpty()) {
+                cmd += "--dns-resolver-addrs"
+                cmd += dnsAddrs
+            }
             Log.d(TAG, "启动 cloudflared: $cmd")
             updateNotification("正在连接 Cloudflare...")
 
@@ -349,8 +358,36 @@ class TunnelService : Service() {
 
     // ─── 通用 ─────────────────────────────────────────────────────
 
-    /** 从 nativeLibraryDir 取可执行二进制 */
-    private fun prepareBinary(name: String): File? {
+    /**
+     * 获取当前活动网络的 DNS 服务器（格式 ip:53）。
+     * Android 沙箱里 Go 程序读不到 resolv.conf，需手动注入给 cloudflared。
+     */
+    private fun systemDnsServers(): List<String> {
+        val result = LinkedHashSet<String>()
+        try {
+            val cm = getSystemService(ConnectivityManager::class.java)
+            val active = cm?.activeNetwork
+            if (active != null) {
+                val lp: LinkProperties? = cm.getLinkProperties(active)
+                lp?.dnsServers?.forEach { addr ->
+                    var ip = addr.hostAddress ?: return@forEach
+                    ip = ip.substringBefore('%') // 去掉 IPv6 的 scope id (fe80::1%wlan0)
+                    if (ip.isBlank() || ip == "::1" || ip == "127.0.0.1") return@forEach
+                    result.add(if (ip.contains(':')) "[$ip]:53" else "$ip:53")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "获取系统 DNS 失败", e)
+        }
+        // 兜底：常见公共 DNS（优先 DNSPod / AliDNS，国内可达性更好）
+        if (result.isEmpty()) {
+            result.add("119.29.29.29:53")
+            result.add("223.5.5.5:53")
+        }
+        return result.toList()
+    }
+
+    /** 从 nativeLibraryDir 取可执行二进制 */    private fun prepareBinary(name: String): File? {
         val f = File(applicationInfo.nativeLibraryDir, name)
         if (!f.exists()) {
             Log.e(TAG, "nativeLibraryDir 中找不到 $name")
