@@ -626,6 +626,24 @@
                             android:inputType="none" />
                     </com.google.android.material.textfield.TextInputLayout>
 
+                    <!-- TCP 模式：远程端口 -->
+                    <com.google.android.material.textfield.TextInputLayout
+                        android:id="@+id/tilFrpRemotePort"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        style="@style/Widget.SelfCamMonitor.TextInput.Outlined"
+                        android:hint="远程端口"
+                        app:helperText="TCP 模式需在 frps 上开放的端口（0 = 由服务端自动分配）"
+                        android:layout_marginBottom="12dp">
+
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/etFrpRemotePort"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:inputType="number"
+                            android:text="0" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
                     <!-- HTTP 模式域名设置（ subdomain.domain 格式） -->
                     <com.google.android.material.textfield.TextInputLayout
                         android:id="@+id/tilFrpDomain"
