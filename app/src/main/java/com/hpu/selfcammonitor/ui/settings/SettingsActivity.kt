@@ -24,7 +24,7 @@ import android.widget.NumberPicker
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
-import android.view.Gravity
+import android.view.View
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
