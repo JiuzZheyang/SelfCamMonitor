@@ -36,6 +36,8 @@ class TunnelService : Service() {
 
     private lateinit var executor: ExecutorService
 
+    @Volatile private var dnsForwarder: LocalDnsForwarder? = null
+
     @Volatile private var cloudflaredProcess: Process? = null
     @Volatile private var frpcProcess: Process? = null
 
@@ -147,6 +149,7 @@ class TunnelService : Service() {
         super.onDestroy()
         // 只清理进程，不再广播（避免覆盖失败/停止原因）
         killProcesses()
+        stopDnsForwarder()
         currentTunnelType = TYPE_NONE
         instance = null
         executor.shutdown()
@@ -188,14 +191,10 @@ class TunnelService : Service() {
                 return@execute
             }
 
-            // Android 沙箱下没有可用的 /etc/resolv.conf，Go 会回退到 127.0.0.1:53/[::1]:53
-            // 导致 SRV 查询 connection refused。手动把系统 DNS 传给 cloudflared。
-            val dnsAddrs = systemDnsServers()
+            // Android 沙箱下没有 /etc/resolv.conf，Go 会回退到 127.0.0.1:53/[::1]:53。
+            // 先启动本地 DNS 中继，让 cloudflared 能正常解析 SRV 记录。
+            ensureDnsForwarder()
             val cmd = mutableListOf(binary.absolutePath, "--no-autoupdate", "tunnel", "run", "--token", token.trim())
-            if (dnsAddrs.isNotEmpty()) {
-                cmd += "--dns-resolver-addrs"
-                cmd += dnsAddrs
-            }
             Log.d(TAG, "启动 cloudflared: $cmd")
             updateNotification("正在连接 Cloudflare...")
 
@@ -269,6 +268,9 @@ class TunnelService : Service() {
                 failAndStop(TYPE_FRP, "找不到 frpc 可执行文件")
                 return@execute
             }
+
+            // frpc 若 server_addr 填域名，同样依赖系统解析器，先启动 DNS 中继
+            ensureDnsForwarder()
 
             val frpcDir = File(filesDir, "frpc").apply { mkdirs() }
             val iniFile = File(frpcDir, "frpc.ini")
@@ -387,6 +389,22 @@ class TunnelService : Service() {
         return result.toList()
     }
 
+    /** 确保本地 DNS 中继已启动（幂等） */
+    private fun ensureDnsForwarder() {
+        if (dnsForwarder?.isRunning == true) return
+        val forwarder = LocalDnsForwarder(systemDnsServers())
+        if (forwarder.start()) {
+            dnsForwarder = forwarder
+        } else {
+            Log.w(TAG, "本地 DNS 中继启动失败，cloudflared/frpc 的域名解析可能不可用")
+        }
+    }
+
+    private fun stopDnsForwarder() {
+        runCatching { dnsForwarder?.stop() }
+        dnsForwarder = null
+    }
+
     /** 从 nativeLibraryDir 取可执行二进制 */    private fun prepareBinary(name: String): File? {
         val f = File(applicationInfo.nativeLibraryDir, name)
         if (!f.exists()) {
@@ -425,6 +443,7 @@ class TunnelService : Service() {
 
     private fun stopAll() {
         killProcesses()
+        stopDnsForwarder()
         currentTunnelType = TYPE_NONE
         tunnelUrl = ""
         broadcastStatus(TYPE_NONE, "", false, "已停止")
