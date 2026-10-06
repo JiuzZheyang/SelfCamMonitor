@@ -162,7 +162,7 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
     }
 
     private fun serveSnapshot(download: Boolean): Response {
-        val jpeg = mjpegStreamer.getLatestJpeg()
+        val jpeg = mjpegStreamer.getLatestJpegFresh(1200)
             ?: return newFixedLengthResponse(
                 Response.Status.SERVICE_UNAVAILABLE, "text/plain", "暂无画面"
             )
@@ -485,7 +485,7 @@ function initDecoder(){
   try{
     if(decoder){try{decoder.close();}catch(_){}decoder=null;}
     decoder=new VideoDecoder({output:onDecoded,error:function(e){onH264Err(e);}});
-    decoder.configure({codec:codecStr,optimizeForLatency:true});
+    decoder.configure({codec:codecStr,optimizeForLatency:true,avc:{format:'annexb'}});
     configuredCodec=codecStr;
     return true;
   }catch(e){decoder=null;return false;}
