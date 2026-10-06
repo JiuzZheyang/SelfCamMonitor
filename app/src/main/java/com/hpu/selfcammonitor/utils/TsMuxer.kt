@@ -160,7 +160,7 @@ class TsMuxer {
         body[i++] = (0xB0 or ((13 ushr 8) and 0x0F)).toByte()
         body[i++] = (13 and 0xFF).toByte()                 // section_length = 13
         body[i++] = 0x00; body[i++] = 0x01                 // transport_stream_id
-        body[i++] = 0xC1                                   // version/current_next
+        body[i++] = 0xC1.toByte()                                   // version/current_next
         body[i++] = 0x00                                   // section_number
         body[i++] = 0x00                                   // last_section_number
         body[i++] = 0x00; body[i++] = 0x01                 // program_number = 1
@@ -182,15 +182,15 @@ class TsMuxer {
         body[i++] = (0xB0 or ((18 ushr 8) and 0x0F)).toByte()
         body[i++] = (18 and 0xFF).toByte()                 // section_length = 18
         body[i++] = 0x00; body[i++] = 0x01                 // program_number = 1
-        body[i++] = 0xC1
+        body[i++] = 0xC1.toByte()
         body[i++] = 0x00; body[i++] = 0x00
         body[i++] = (0xE0 or ((PID_VIDEO ushr 8) and 0x1F)).toByte()
         body[i++] = (PID_VIDEO and 0xFF).toByte()          // PCR_PID = video
-        body[i++] = 0xF0; body[i++] = 0x00                 // program_info_length = 0
+        body[i++] = 0xF0.toByte(); body[i++] = 0x00                 // program_info_length = 0
         body[i++] = STREAM_TYPE_H264.toByte()
         body[i++] = (0xE0 or ((PID_VIDEO ushr 8) and 0x1F)).toByte()
         body[i++] = (PID_VIDEO and 0xFF).toByte()
-        body[i++] = 0xF0; body[i++] = 0x00                 // ES_info_length = 0
+        body[i++] = 0xF0.toByte(); body[i++] = 0x00                 // ES_info_length = 0
         val crc = crc32(body, 0, 14)
         body[i++] = ((crc ushr 24) and 0xFF).toByte()
         body[i++] = ((crc ushr 16) and 0xFF).toByte()
