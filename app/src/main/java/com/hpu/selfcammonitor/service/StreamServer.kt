@@ -46,6 +46,13 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
         val s = session
             ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "bad request")
 
+        // 跨隧道访问：预检请求不带凭证，需在鉴权前放行
+        if (s.method == Method.OPTIONS) {
+            val pre = newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "")
+            addCorsHeaders(pre)
+            return pre
+        }
+
         // 认证检查
         if (username != null && password != null) {
             val auth = s.headers["authorization"]
@@ -69,7 +76,8 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
         }
 
         val uri = s.uri
-        return when {
+
+        val res = when {
             uri == "/" || uri == "/index.html" -> htmlPage()
             uri == "/gallery" || uri == "/gallery.html" -> galleryPage()
             uri == "/live.m3u8" -> servePlaylist()
@@ -89,6 +97,16 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
             uri.startsWith("/play/") -> serveRecordingFile(s, uri, download = false)
             else -> newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 Not Found")
         }
+        addCorsHeaders(res)
+        return res
+    }
+
+    /** 允许跨源读取（多个隧道域名指向同一后端，浏览器可任选链路下载） */
+    private fun addCorsHeaders(res: Response) {
+        res.addHeader("Access-Control-Allow-Origin", "*")
+        res.addHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        res.addHeader("Access-Control-Allow-Headers", "Range, Content-Type, Authorization")
+        res.addHeader("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges, Content-Disposition")
     }
 
     // ─── 端点实现 ──────────────────────────────────────────────
@@ -542,7 +560,7 @@ main{flex-direction:row}
 <aside id="panel">
 <div class="prow"><label class="k">流畅度</label><select id="sel-buf"><option value="1">低延迟</option><option value="2" selected>平衡</option><option value="4">流畅（大缓冲）</option></select></div>
 <div class="prow"><label class="k">分辨率</label><select id="sel-res"></select></div>
-<div class="prow"><label class="k">帧率</label><input id="rng-fps" type="range" min="1" max="30" step="1" value="16"><span class="val" id="lbl-fps">16 fps</span></div>
+<div class="prow"><label class="k">帧率</label><input id="rng-fps" type="range" min="1" max="60" step="1" value="16"><span class="val" id="lbl-fps">16 fps</span></div>
 <div class="prow"><label class="k">摄像头</label><select id="sel-face"><option value="0">后置</option><option value="1">前置</option></select></div>
 <div class="prow"><label class="k">录像模式</label><select id="sel-mode"><option value="2">仅预览</option><option value="0">连续录像</option><option value="1">运动触发</option></select></div>
 <div class="prow"><label class="k">MJPEG</label><label class="switch"><input id="sw-mjpeg" type="checkbox"><span></span></label><span class="val" id="lbl-mjpeg">开启</span></div>
@@ -874,6 +892,8 @@ header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:10px
 .dlg video{width:100%;max-height:60vh;background:#000;display:block}
 .dlg .ft{display:flex;flex-wrap:wrap;gap:8px;padding:12px 14px;border-top:1px solid var(--line);align-items:center}
 .sp{flex:1}
+.ft2{padding-top:2px;border-top:none}
+.lb{font-size:12px;color:var(--mut)}
 .x{width:34px;height:34px;border-radius:50%;border:1px solid var(--line);background:var(--card2);color:var(--fg);font-size:16px;cursor:pointer;flex-shrink:0}
 .pbtn{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
 .prog{display:flex;align-items:center;gap:10px;width:100%;font-size:12px;color:var(--mut)}
@@ -908,9 +928,14 @@ header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:10px
 <div class="ft">
 <button class="btn pbtn" id="m-dl">&#11123; 下载</button>
 <button class="btn" id="m-chunk">&#9986; 分片下载</button>
-<button class="btn" id="m-copy">&#128279; 复制直连</button>
 <span class="sp"></span>
 <button class="btn" id="m-open">&#128065; 新窗口</button>
+</div>
+<div class="ft ft2">
+<span class="lb">下载链路</span>
+<select id="sel-link"><option value="auto">当前页面</option></select>
+<span class="sp"></span>
+<button class="btn" id="m-copy">&#128279; 复制链接</button>
 </div>
 <div class="ft" id="m-progwrap" style="display:none">
 <div class="prog"><div class="progbar"><i id="m-progbar"></i></div><span id="m-progtxt">0%</span></div>
@@ -923,13 +948,31 @@ var grid=document.getElementById('grid'),statEl=document.getElementById('stat'),
 var modal=document.getElementById('modal'),mVideo=document.getElementById('m-video'),mTitle=document.getElementById('m-title');
 var progwrap=document.getElementById('m-progwrap'),progbar=document.getElementById('m-progbar'),progtxt=document.getElementById('m-progtxt');
 var selChunk=document.getElementById('sel-chunk');
-var files=[],curRel='';
+var files=[],curRel='',selLink=document.getElementById('sel-link'),linkMode='auto',tunnels={cf:'',frp:'',lan:''},linkLoaded=false;
 function toast(m){toastEl.textContent=m;toastEl.classList.add('show');clearTimeout(toastEl._t);toastEl._t=setTimeout(function(){toastEl.classList.remove('show');},2200);}
 function fmtSize(n){n=Number(n)||0;if(!n)return '0 B';var u=['B','KB','MB','GB'];var i=0;while(n>=1024&&i<u.length-1){n/=1024;i++;}return (i?n.toFixed(1):n)+' '+u[i];}
 function fmtDur(ms){ms=Number(ms)||0;if(ms<=0)return '--:--';var s=Math.round(ms/1000);var m=Math.floor(s/60);s=s%60;return (m<10?'0':'')+m+':'+(s<10?'0':'')+s;}
 function fmtTime(ts){var d=new Date(Number(ts)||0);function p(n){return (n<10?'0':'')+n;}return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}
 function esc(s){return String(s).replace(/[&<>"']/g,function(c){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];});}
+function baseUrl(){if(linkMode==='cf')return tunnels.cf;if(linkMode==='frp')return tunnels.frp;if(linkMode==='lan')return tunnels.lan;return '';}
+function dlUrl(rel){return baseUrl()+'/dl/'+encodeURI(rel);}
+function playUrl(rel){return baseUrl()+'/play/'+encodeURI(rel);}
+function trimSlash(u){u=String(u);while(u.length&&u.charAt(u.length-1)==='/')u=u.slice(0,-1);return u;}
+function loadLinks(){
+  fetch('/api/state',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    d=d||{};
+    tunnels.cf=(d.cfUrl&&String(d.cfUrl).indexOf('http')===0)?trimSlash(d.cfUrl):'';
+    tunnels.frp=(d.frpUrl&&String(d.frpUrl).indexOf('http')===0)?trimSlash(d.frpUrl):'';
+    tunnels.lan=d.lanIp?('http://'+d.lanIp+':8080'):'';
+    var h='<option value="auto">当前页面</option>';
+    if(tunnels.cf)h+='<option value="cf">Cloudflare 隧道</option>';
+    if(tunnels.frp)h+='<option value="frp">frp 隧道</option>';
+    if(tunnels.lan)h+='<option value="lan">局域网直连</option>';
+    selLink.innerHTML=h;linkMode='auto';linkLoaded=true;
+  }).catch(function(){linkLoaded=true;});
+}
 function load(){
+  if(!linkLoaded)loadLinks();
   statEl.textContent='加载中...';
   fetch('/api/recordings',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
     if(d&&d.error){statEl.textContent='错误: '+d.error;return;}
@@ -959,13 +1002,13 @@ function openPlayer(i){
   var f=files[i];if(!f)return;
   curRel=f.relPath;
   mTitle.textContent=f.name+'  ·  '+fmtSize(f.size)+'  ·  '+fmtDur(f.durationMs);
-  mVideo.src='/play/'+encodeURI(f.relPath);
+  mVideo.src=playUrl(f.relPath);
   progwrap.style.display='none';progbar.style.width='0';progtxt.textContent='0%';
   modal.classList.add('show');
   try{mVideo.play().catch(function(){});}catch(e){}
 }
 function closePlayer(){try{mVideo.pause();}catch(e){}mVideo.removeAttribute('src');try{mVideo.load();}catch(e){}modal.classList.remove('show');}
-function download(rel){var a=document.createElement('a');a.href='/dl/'+encodeURI(rel);a.download=(rel.split('/').pop()||'video.mp4');document.body.appendChild(a);a.click();a.remove();}
+function download(rel){var u=dlUrl(rel);var a=document.createElement('a');a.href=u;a.download=(rel.split('/').pop()||'video.mp4');if(u.indexOf('http')===0&&u.indexOf(location.origin)!==0)a.target='_blank';document.body.appendChild(a);a.click();a.remove();}
 function doChunkDownload(){
   var rel=curRel;if(!rel)return;
   var f=null;for(var i=0;i<files.length;i++){if(files[i].relPath===rel){f=files[i];break;}}
@@ -979,7 +1022,7 @@ function doChunkDownload(){
     function step(){
       if(start>=total){return writable.close().then(function(){toast('分片下载完成');});}
       var end=Math.min(start+chunk,total)-1;
-      return fetch('/dl/'+encodeURI(rel),{headers:{'Range':'bytes='+start+'-'+end}}).then(function(resp){
+      return fetch(dlUrl(rel),{headers:{'Range':'bytes='+start+'-'+end}}).then(function(resp){
         if(resp.status!==206&&!resp.ok)throw new Error('HTTP '+resp.status);
         return resp.arrayBuffer();
       }).then(function(buf){
@@ -1002,10 +1045,8 @@ function doChunkDownload(){
 function copyText(t){if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){toast('已复制: '+t);},function(){toast(t);});}else{toast(t);}}
 function copyDirect(){
   var rel=curRel;if(!rel)return;
-  fetch('/api/state',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
-    var ip=(d&&d.lanIp)||location.hostname;
-    copyText('http://'+ip+':8080/dl/'+encodeURI(rel));
-  }).catch(function(){copyText(location.origin+'/dl/'+encodeURI(rel));});
+  var u=dlUrl(rel);if(u.indexOf('http')!==0)u=location.origin+u;
+  copyText(u);
 }
 document.getElementById('btn-refresh').addEventListener('click',load);
 document.getElementById('m-close').addEventListener('click',closePlayer);
@@ -1013,7 +1054,8 @@ modal.addEventListener('click',function(e){if(e.target===modal)closePlayer();});
 document.getElementById('m-dl').addEventListener('click',function(){if(curRel)download(curRel);});
 document.getElementById('m-chunk').addEventListener('click',doChunkDownload);
 document.getElementById('m-copy').addEventListener('click',copyDirect);
-document.getElementById('m-open').addEventListener('click',function(){if(curRel)window.open('/play/'+encodeURI(curRel),'_blank');});
+document.getElementById('m-open').addEventListener('click',function(){if(curRel)window.open(playUrl(curRel),'_blank');});
+selLink.addEventListener('change',function(){linkMode=selLink.value;});
 load();
 setInterval(load,15000);
 </script>
