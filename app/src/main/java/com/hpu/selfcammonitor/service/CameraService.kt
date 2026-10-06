@@ -343,7 +343,7 @@ class CameraService : LifecycleService(), StreamControl {
         continuousSegmentDurationMs = prefs.getInt("continuous_segment_sec", DEFAULT_CONTINUOUS_SEGMENT_SEC) * 1000L
 
         // 帧率控制（每秒平均策略）
-        targetFps = prefs.getInt("fps", 16).coerceIn(1, 30)
+        targetFps = prefs.getInt("fps", 16).coerceIn(1, 60)
 
         // 镜头选择（0=后置，1=前置）；与分辨率/帧率一样，启动相机时生效
         useFrontCamera = prefs.getInt("camera_facing", 0) == 1
@@ -896,6 +896,10 @@ class CameraService : LifecycleService(), StreamControl {
         "audio" to audioActive,
         "manualDurationSec" to manualDurationSecCfg,
         "lanIp" to getLocalIpAddress(),
+        "cfUrl" to TunnelService.getTunnelUrl(TunnelService.TYPE_CLOUDFLARED),
+        "frpUrl" to TunnelService.getTunnelUrl(TunnelService.TYPE_FRP),
+        "cfRunning" to TunnelService.isTunnelRunning(TunnelService.TYPE_CLOUDFLARED),
+        "frpRunning" to TunnelService.isTunnelRunning(TunnelService.TYPE_FRP),
         "withinWindow" to isWithinTimeWindow(),
         "resolutions" to supportedResolutions(),
     )
@@ -947,7 +951,7 @@ class CameraService : LifecycleService(), StreamControl {
                     editor.putString("resolution", v); needRebind = true; applied.add(key)
                 }
                 "fps" -> v.toIntOrNull()?.let {
-                    editor.putInt("fps", it.coerceIn(1, 30)); needRebind = true; applied.add(key)
+                    editor.putInt("fps", it.coerceIn(1, 60)); needRebind = true; applied.add(key)
                 }
                 "facing" -> v.toIntOrNull()?.let {
                     editor.putInt("camera_facing", it.coerceIn(0, 1)); needRebind = true; applied.add(key)
@@ -1495,9 +1499,9 @@ class CameraService : LifecycleService(), StreamControl {
         hlsManager.reset()  // 编码器重启 → 清掉旧时间线的分片（PTS 单调，避免 MSE 倒退）
         if (streamEpochUs == 0L) streamEpochUs = System.nanoTime() / 1000
         startAudioIfPossible()  // 在写 PMT 前决定是否带音轨，保证整段流一致
-        val fps = targetFps.coerceIn(1, 30)
-        // 码率约为 0.07 bit/像素/帧（1080p@15 ≈ 2.2Mbps），钳制在 1.5~8 Mbps
-        val bitrate = (w.toLong() * h * fps * 0.07).toInt().coerceIn(1_500_000, 8_000_000)
+        val fps = targetFps.coerceIn(1, 60)
+        // 码率约为 0.08 bit/像素/帧（1080p@30 ≈ 5Mbps，1080p@60 ≈ 10Mbps），钳制在 1.5~16 Mbps
+        val bitrate = (w.toLong() * h * fps * 0.08).toInt().coerceIn(1_500_000, 16_000_000)
         val enc = H264Encoder { annexb, key, ptsUs ->
             hlsManager.feed(annexb, ptsUs * 9 / 100, key)
         }
