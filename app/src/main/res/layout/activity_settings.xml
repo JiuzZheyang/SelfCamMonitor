@@ -86,7 +86,7 @@
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
-                        android:max="30"
+                        android:max="60"
                         android:progress="16"
                         android:layout_marginEnd="16dp" />
 
@@ -462,22 +462,73 @@
                     </LinearLayout>
                 </LinearLayout>
 
-                <!-- 穿透方式选择 -->
-                <com.google.android.material.textfield.TextInputLayout
+                <!-- 自动启动开关 -->
+                <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    style="@style/Widget.SelfCamMonitor.TextInput.Dropdown"
-                    android:hint="穿透方式"
-                    android:layout_marginBottom="12dp">
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:paddingTop="4dp"
+                    android:paddingBottom="4dp">
 
-                    <AutoCompleteTextView
-                        android:id="@+id/spinnerTunnelType"
-                        android:layout_width="match_parent"
+                    <LinearLayout
+                        android:layout_width="0dp"
                         android:layout_height="wrap_content"
-                        android:inputType="none" />
-                </com.google.android.material.textfield.TextInputLayout>
+                        android:layout_weight="1"
+                        android:orientation="vertical">
 
-                <!-- Cloudflare Tunnel Token -->
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="启动 App 自动连接"
+                            android:textSize="14sp"
+                            android:textStyle="bold"
+                            android:textColor="@color/text_primary" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="打开 App 时自动启动下方已开启的穿透"
+                            android:textSize="12sp"
+                            android:textColor="@color/text_secondary"
+                            android:layout_marginTop="2dp" />
+                    </LinearLayout>
+
+                    <com.google.android.material.switchmaterial.SwitchMaterial
+                        android:id="@+id/switchTunnelAutoStart"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:background="@color/divider"
+                    android:layout_marginTop="12dp"
+                    android:layout_marginBottom="14dp" />
+
+                <!-- Cloudflare Tunnel 区块 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Cloudflare Tunnel"
+                        android:textSize="15sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/text_primary" />
+
+                    <com.google.android.material.switchmaterial.SwitchMaterial
+                        android:id="@+id/switchCfEnabled"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
                 <com.google.android.material.textfield.TextInputLayout
                     android:id="@+id/tilCloudflaredToken"
                     android:layout_width="match_parent"
@@ -485,8 +536,8 @@
                     style="@style/Widget.SelfCamMonitor.TextInput.Outlined"
                     android:hint="Cloudflare Tunnel Token"
                     app:helperText="在 dash.cloudflare.com 创建 Tunnel 并复制 Token"
-                    android:layout_marginBottom="12dp"
-                    android:visibility="gone">
+                    android:layout_marginTop="10dp"
+                    android:layout_marginBottom="8dp">
 
                     <com.google.android.material.textfield.TextInputEditText
                         android:id="@+id/etCloudflaredToken"
@@ -495,22 +546,75 @@
                         android:inputType="textPassword" />
                 </com.google.android.material.textfield.TextInputLayout>
 
-                <!-- frp 设置区域 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:id="@+id/tvCfStatus"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="未启动"
+                        android:textSize="13sp"
+                        android:textColor="@color/text_secondary"
+                        android:paddingStart="10dp"
+                        android:paddingEnd="10dp"
+                        android:paddingTop="4dp"
+                        android:paddingBottom="4dp"
+                        android:background="@drawable/bg_status_idle"
+                        android:textIsSelectable="true" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnCfCopy"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="复制地址"
+                        android:minWidth="0dp"
+                        android:visibility="gone"
+                        style="@style/Widget.Material3.Button.TextButton" />
+                </LinearLayout>
+
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:background="@color/divider"
+                    android:layout_marginTop="14dp"
+                    android:layout_marginBottom="14dp" />
+
+                <!-- frp 区块 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="10dp">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="frp"
+                        android:textSize="15sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/text_primary" />
+
+                    <com.google.android.material.switchmaterial.SwitchMaterial
+                        android:id="@+id/switchFrpEnabled"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <!-- frp 详细配置 -->
                 <LinearLayout
                     android:id="@+id/layoutFrpSettings"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:orientation="vertical"
-                    android:visibility="gone">
+                    android:orientation="vertical">
 
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="frp 服务器配置"
-                        android:textSize="13sp"
-                        android:textStyle="bold"
-                        android:textColor="@color/primary"
-                        android:layout_marginBottom="10dp" />
+                    
 
                     <!-- frps 服务器地址 -->
                     <com.google.android.material.textfield.TextInputLayout
@@ -677,66 +781,36 @@
                     </com.google.android.material.textfield.TextInputLayout>
                 </LinearLayout>
 
-                <View
-                    android:layout_width="match_parent"
-                    android:layout_height="1dp"
-                    android:background="@color/divider"
-                    android:layout_marginTop="8dp"
-                    android:layout_marginBottom="16dp" />
-
-                <!-- 穿透状态 -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="horizontal"
-                    android:gravity="center_vertical">
+                    android:gravity="center_vertical"
+                    android:layout_marginTop="4dp">
 
-                    <LinearLayout
+                    <TextView
+                        android:id="@+id/tvFrpStatus"
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
-                        android:orientation="vertical">
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:text="运行状态"
-                            android:textSize="14sp"
-                            android:textStyle="bold"
-                            android:textColor="@color/text_primary" />
-
-                        <TextView
-                            android:id="@+id/tvTunnelStatus"
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:text="未连接"
-                            android:textSize="13sp"
-                            android:textColor="@color/text_secondary"
-                            android:paddingStart="10dp"
-                            android:paddingEnd="10dp"
-                            android:paddingTop="4dp"
-                            android:paddingBottom="4dp"
-                            android:layout_marginTop="6dp"
-                            android:background="@drawable/bg_status_idle"
-                            android:textIsSelectable="true" />
-                    </LinearLayout>
+                        android:text="未启动"
+                        android:textSize="13sp"
+                        android:textColor="@color/text_secondary"
+                        android:paddingStart="10dp"
+                        android:paddingEnd="10dp"
+                        android:paddingTop="4dp"
+                        android:paddingBottom="4dp"
+                        android:background="@drawable/bg_status_idle"
+                        android:textIsSelectable="true" />
 
                     <com.google.android.material.button.MaterialButton
-                        android:id="@+id/btnCopyTunnelUrl"
+                        android:id="@+id/btnFrpCopy"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:text="复制地址"
                         android:minWidth="0dp"
                         android:visibility="gone"
                         style="@style/Widget.Material3.Button.TextButton" />
-
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/btnTunnelToggle"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="启动"
-                        android:layout_marginStart="8dp"
-                        style="@style/Widget.Material3.Button.TonalButton" />
                 </LinearLayout>
             </LinearLayout>
         </androidx.cardview.widget.CardView>
