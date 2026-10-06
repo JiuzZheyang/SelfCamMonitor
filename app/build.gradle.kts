@@ -14,8 +14,8 @@ android {
         applicationId = "com.hpu.selfcammonitor"
         minSdk = 25
         targetSdk = 36
-        versionCode = 16
-        versionName = "2.3.10"
+        versionCode = 17
+        versionName = "2.3.11"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
