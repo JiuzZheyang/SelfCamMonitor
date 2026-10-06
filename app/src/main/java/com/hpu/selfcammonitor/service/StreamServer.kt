@@ -305,6 +305,7 @@ main{flex-direction:row}
 <div class="brand"><span class="dot connecting" id="dot"></span><span class="t" id="title">SelfCamMonitor</span></div>
 <div class="badges">
 <span class="badge" id="b-fps">-- fps</span>
+<span class="badge" id="b-net">-- MB/s</span>
 <span class="badge" id="b-res">--</span>
 <span class="badge" id="b-face">--</span>
 <span class="badge rec" id="b-rec" style="display:none">录制中</span>
@@ -338,10 +339,10 @@ var selRes=document.getElementById('sel-res'),rngFps=document.getElementById('rn
 lblFps=document.getElementById('lbl-fps'),selFace=document.getElementById('sel-face'),
 swMjpeg=document.getElementById('sw-mjpeg'),lblMjpeg=document.getElementById('lbl-mjpeg'),
 selMode=document.getElementById('sel-mode'),btnRec=document.getElementById('btn-rec'),
-bFps=document.getElementById('b-fps'),bRes=document.getElementById('b-res'),
+bFps=document.getElementById('b-fps'),bNet=document.getElementById('b-net'),bRes=document.getElementById('b-res'),
 bFace=document.getElementById('b-face'),bRec=document.getElementById('b-rec'),
 pinfo=document.getElementById('pinfo'),toastEl=document.getElementById('toast');
-var HI=3000;
+var HI=2000;
 var rot=0,zoom=1,panX=0,panY=0,stat='connecting',wantStream=true,reloadTimer=null;
 var resFilled=false,userRec=false,firstLoad=false;
 function setStatus(s){
@@ -407,10 +408,15 @@ function toggleFs(){
   if(!fs){if(e.requestFullscreen)e.requestFullscreen();else if(e.webkitRequestFullscreen)e.webkitRequestFullscreen();}
   else{if(document.exitFullscreen)document.exitFullscreen();else if(document.webkitExitFullscreen)document.webkitExitFullscreen();}
 }
+function fmtRate(bps){
+  var mb=bps/1048576;
+  return mb.toFixed(2)+' MB/s';
+}
 function api(path){return fetch(path,{cache:'no-store'}).then(function(r){return r.json();});}
 function refresh(d){
   if(!d||d.error)return;
   bFps.textContent=(d.currentFps||0)+' fps';
+  if(typeof d.netRateBps==='number')bNet.textContent=fmtRate(d.netRateBps);
   bRes.textContent=d.resolution||'--';
   bFace.textContent=(d.facing===1?'前置':'后置');
   if(!resFilled&&d.resolutions&&d.resolutions.length){
@@ -430,6 +436,7 @@ function refresh(d){
   var parts=[];
   parts.push('模式: '+(d.modeLabel||'--'));
   if(typeof d.clientCount==='number')parts.push('观看: '+d.clientCount);
+  if(typeof d.netRateBps==='number')parts.push('网络: '+fmtRate(d.netRateBps));
   if(typeof d.lastFrameAge==='number'&&d.lastFrameAge<900000)parts.push('画面延迟: '+d.lastFrameAge+'ms');
   pinfo.textContent=parts.join('  ·  ');
 }
