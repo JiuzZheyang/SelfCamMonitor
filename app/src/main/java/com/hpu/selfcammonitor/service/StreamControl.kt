@@ -25,9 +25,22 @@ interface StreamControl {
      */
     fun applyConfig(params: Map<String, String>): Map<String, Any?>
 
-    /** 手动开始录像（不受录像模式限制），返回是否受理 */
-    fun startManualRecording(): Boolean
+    /**
+     * 手动开始录像（不受录像模式限制）。
+     * @param durationSec 录制时长（秒）；<=0 表示一直录到调用 stopManualRecording
+     * 返回是否受理
+     */
+    fun startManualRecording(durationSec: Int): Boolean
 
     /** 手动停止录像，返回是否受理 */
     fun stopManualRecording(): Boolean
+
+    /** 列出已保存的录像（按修改时间倒序）。每项包含 relPath/name/date/size/modified/durationMs */
+    fun listRecordings(): List<Map<String, Any?>>
+
+    /** 把相对路径安全解析为录像文件（防目录穿越）；不存在或非法返回 null */
+    fun recordingFile(relPath: String): java.io.File?
+
+    /** 录像缩略图（jpg 字节）；无法生成返回 null */
+    fun recordingThumbnail(relPath: String): ByteArray?
 }
