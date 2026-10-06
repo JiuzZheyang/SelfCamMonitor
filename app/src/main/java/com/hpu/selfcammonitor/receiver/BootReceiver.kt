@@ -6,10 +6,16 @@ import android.content.Intent
 import android.os.Build
 import android.util.Log
 import com.hpu.selfcammonitor.service.CameraService
+import com.hpu.selfcammonitor.service.TunnelService
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val prefs = context.getSharedPreferences("camera_prefs", Context.MODE_PRIVATE)
+        // 内网穿透随开机自启（独立于监控开关，按 auto-start 偏好决定）
+        if (prefs.getBoolean(TunnelService.PREF_AUTO_START, true)) {
+            runCatching { TunnelService.startAllEnabled(context) }
+                .onFailure { Log.e("BootReceiver", "开机自启穿透失败", it) }
+        }
         if (prefs.getBoolean("boot_start", false)) {
             // 启动服务
             if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
