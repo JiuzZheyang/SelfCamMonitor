@@ -2,6 +2,7 @@ package com.hpu.selfcammonitor.service
 
 import fi.iki.elonen.NanoHTTPD
 import java.io.ByteArrayInputStream
+import java.io.FileInputStream
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
 import java.net.URLDecoder
@@ -70,16 +71,22 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
         val uri = s.uri
         return when {
             uri == "/" || uri == "/index.html" -> htmlPage()
+            uri == "/gallery" || uri == "/gallery.html" -> galleryPage()
             uri == "/live.m3u8" -> servePlaylist()
             uri.startsWith("/seg/") -> serveSegment(uri)
             uri == "/hls.js" -> serveHlsJs()
             uri == "/video" -> serveVideo()
             uri == "/status" -> serveLegacyStatus()
             uri == "/snapshot" -> serveSnapshot(download = false)
+            uri == "/api" -> serveApiDoc()
             uri == "/api/state" -> serveState()
             uri == "/api/config" -> serveConfig(s)
             uri == "/api/record" -> serveRecord(s)
+            uri == "/api/recordings" -> serveRecordings()
             uri == "/api/snapshot" -> serveSnapshot(download = true)
+            uri.startsWith("/thumb/") -> serveThumb(uri)
+            uri.startsWith("/dl/") -> serveRecordingFile(s, uri, download = true)
+            uri.startsWith("/play/") -> serveRecordingFile(s, uri, download = false)
             else -> newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 Not Found")
         }
     }
@@ -88,6 +95,12 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
 
     private fun htmlPage(): Response {
         val res = newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", VIEWER_HTML)
+        res.addHeader("Cache-Control", "no-store")
+        return res
+    }
+
+    private fun galleryPage(): Response {
+        val res = newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", GALLERY_HTML)
         res.addHeader("Cache-Control", "no-store")
         return res
     }
@@ -183,16 +196,160 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
         return try {
             val params = readParams(session)
             val ok = when (params["action"]) {
-                "start" -> ctrl.startManualRecording()
+                "start" -> {
+                    val dur = params["duration"]?.toIntOrNull()
+                        ?: params["seconds"]?.toIntOrNull()
+                        ?: params["t"]?.toIntOrNull() ?: 0
+                    ctrl.startManualRecording(dur.coerceIn(0, 24 * 3600))
+                }
                 "stop" -> ctrl.stopManualRecording()
                 else -> false
             }
             val result = LinkedHashMap<String, Any?>(ctrl.state())
             result["ok"] = ok
+            result["action"] = params["action"] ?: ""
             jsonResponse(toJson(result))
         } catch (e: Exception) {
             jsonResponse("{\"error\":\"${jsonEscape(e.message ?: "record error")}\"}")
         }
+    }
+
+    /** 录像列表（相册数据源） */
+    private fun serveRecordings(): Response {
+        val ctrl = control
+            ?: return jsonResponse("{\"error\":\"服务未就绪\"}")
+        return try {
+            val list = ctrl.listRecordings()
+            val sb = StringBuilder("{\"dir\":\"Recordings\",\"files\":[")
+            var first = true
+            for (item in list) {
+                if (!first) sb.append(',')
+                first = false
+                sb.append(toJson(item))
+            }
+            sb.append("]}")
+            jsonResponse(sb.toString())
+        } catch (e: Exception) {
+            jsonResponse("{\"error\":\"${jsonEscape(e.message ?: "list error")}\"}")
+        }
+    }
+
+    /** 录像缩略图 */
+    private fun serveThumb(uri: String): Response {
+        val ctrl = control
+            ?: return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "\u670d\u52a1\u672a\u5c31\u7eea")
+        val rel = urlDecode(uri.removePrefix("/thumb/").substringBefore('?'))
+        val bytes = ctrl.recordingThumbnail(rel)
+            ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "no thumb")
+        val res = newFixedLengthResponse(
+            Response.Status.OK, "image/jpeg", ByteArrayInputStream(bytes), bytes.size.toLong()
+        )
+        res.addHeader("Cache-Control", "public, max-age=600")
+        return res
+    }
+
+    /**
+     * 录像文件：支持 HTTP Range（断点续传 / 分片下载 / 浏览器拖动播放）。
+     * /play/<rel> 内联播放；/dl/<rel> 附件下载。
+     */
+    private fun serveRecordingFile(session: IHTTPSession, uri: String, download: Boolean): Response {
+        val ctrl = control
+            ?: return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "\u670d\u52a1\u672a\u5c31\u7eea")
+        val prefix = if (download) "/dl/" else "/play/"
+        val rel = urlDecode(uri.removePrefix(prefix).substringBefore('?'))
+        val file = ctrl.recordingFile(rel)
+            ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 not found")
+        val total = file.length()
+        val mime = "video/mp4"
+
+        var start = 0L
+        var end = total - 1
+        var partial = false
+        val rangeHeader = session.headers["range"]
+        if (rangeHeader != null) {
+            val r = parseRange(rangeHeader, total)
+            if (r != null) {
+                start = r.first; end = r.second; partial = true
+            } else if (rangeHeader.trim().startsWith("bytes=")) {
+                val bad = newFixedLengthResponse(
+                    Response.Status.RANGE_NOT_SATISFIABLE, "text/plain", "range not satisfiable"
+                )
+                bad.addHeader("Content-Range", "bytes */$total")
+                return bad
+            }
+        }
+        val len = (end - start + 1).coerceAtLeast(0)
+        val fis = FileInputStream(file)
+        if (start > 0) skipFully(fis, start)
+        val status = if (partial) Response.Status.PARTIAL_CONTENT else Response.Status.OK
+        val res = newFixedLengthResponse(status, mime, fis, len)
+        res.addHeader("Accept-Ranges", "bytes")
+        if (partial) res.addHeader("Content-Range", "bytes $start-$end/$total")
+        res.addHeader("Content-Disposition",
+            if (download) "attachment; filename=\"${file.name}\"" else "inline")
+        res.addHeader("Cache-Control", "no-store")
+        return res
+    }
+
+    /** 解析 Range 请求头（仅处理单区间），返回 (start,end)；不可满足返回 null */
+    private fun parseRange(header: String, total: Long): Pair<Long, Long>? {
+        val h = header.trim()
+        if (!h.startsWith("bytes=")) return null
+        var spec = h.substring(6).trim()
+        if (spec.contains(',')) spec = spec.substringBefore(',').trim()
+        val dash = spec.indexOf('-')
+        if (dash < 0) return null
+        val sStr = spec.substring(0, dash).trim()
+        val eStr = spec.substring(dash + 1).trim()
+        var start: Long
+        var end: Long
+        try {
+            if (sStr.isEmpty()) {
+                val n = eStr.toLong()
+                if (n <= 0 || total <= 0) return null
+                start = (total - n).coerceAtLeast(0)
+                end = total - 1
+            } else {
+                start = sStr.toLong()
+                end = if (eStr.isEmpty()) total - 1 else eStr.toLong()
+            }
+        } catch (e: Exception) {
+            return null
+        }
+        if (total <= 0 || start > end || start >= total) return null
+        if (end >= total) end = total - 1
+        return Pair(start, end)
+    }
+
+    private fun skipFully(fis: FileInputStream, n: Long) {
+        var remaining = n
+        while (remaining > 0) {
+            val skipped = fis.skip(remaining)
+            if (skipped <= 0) {
+                if (fis.read() < 0) break
+                remaining -= 1
+            } else {
+                remaining -= skipped
+            }
+        }
+    }
+
+    /** API 说明（便于其他设备对接） */
+    private fun serveApiDoc(): Response {
+        val doc = "{" +
+            "\"endpoints\":[" +
+            "{\"path\":\"/api/record?action=start&duration=N\",\"desc\":\"开始录制，N 秒后自动停止（duration=0 表示不限时）\"}," +
+            "{\"path\":\"/api/record?action=stop\",\"desc\":\"停止录制\"}," +
+            "{\"path\":\"/api/recordings\",\"desc\":\"录像列表 JSON\"}," +
+            "{\"path\":\"/dl/<date>/<file>.mp4\",\"desc\":\"下载（支持 Range 断点/分片）\"}," +
+            "{\"path\":\"/play/<date>/<file>.mp4\",\"desc\":\"网页内联播放（支持 Range）\"}," +
+            "{\"path\":\"/thumb/<date>/<file>.mp4\",\"desc\":\"缩略图 jpg\"}," +
+            "{\"path\":\"/gallery\",\"desc\":\"录像相册网页\"}," +
+            "{\"path\":\"/api/state\",\"desc\":\"设备状态\"}," +
+            "{\"path\":\"/api/config?resolution=&fps=&facing=&mode=&mjpeg=\",\"desc\":\"应用配置\"}," +
+            "{\"path\":\"/api/snapshot\",\"desc\":\"下载当前截图\"}" +
+            "]}"
+        return jsonResponse(doc)
     }
 
     private fun serveSnapshot(download: Boolean): Response {
@@ -317,7 +474,7 @@ main{flex:1;display:flex;flex-direction:column;min-height:0}
 #overlay{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:#7c8798;font-size:15px;display:none;z-index:5}
 #overlay.show{display:block}
 .vtoolbar{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);display:flex;gap:8px;z-index:6}
-.iconbtn{width:44px;height:44px;border-radius:50%;border:1px solid rgba(255,255,255,.18);background:rgba(20,25,32,.72);color:#e6ebf2;font-size:17px;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px);touch-action:manipulation}
+.iconbtn{width:44px;height:44px;border-radius:50%;border:1px solid rgba(255,255,255,.18);background:rgba(20,25,32,.72);color:#e6ebf2;font-size:17px;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px);touch-action:manipulation;text-decoration:none}
 .iconbtn:active{background:rgba(59,130,246,.85)}
 .iconbtn.rec.on{background:var(--err);border-color:var(--err)}
 .iconbtn.on{background:var(--acc);border-color:var(--acc)}
@@ -377,6 +534,7 @@ main{flex-direction:row}
 <button class="iconbtn" id="btn-r" title="旋转">&#8635;</button>
 <button class="iconbtn" id="btn-shot" title="截图">&#128247;</button>
 <button class="iconbtn rec" id="btn-rec" title="录像">&#9679;</button>
+<a class="iconbtn" id="btn-gal" href="/gallery" title="录像相册">&#128193;</a>
 <button class="iconbtn" id="btn-fs" title="全屏">&#9974;</button>
 <button class="iconbtn" id="btn-snd" title="声音">&#128263;</button>
 </div>
@@ -669,6 +827,195 @@ document.addEventListener('webkitfullscreenchange',function(){applyTransform();}
 chooseMode();
 heartbeat();
 setInterval(heartbeat,HI);
+</script>
+</body>
+</html>
+        """.trimIndent()
+
+        private val GALLERY_HTML = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1216">
+<title>录像相册 - SelfCamMonitor</title>
+<style>
+:root{--bg:#0f1216;--card:#161b22;--card2:#1e242d;--line:#2a323d;--fg:#e6ebf2;--mut:#8b97a7;--acc:#3b82f6;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;min-height:100vh}
+a{color:var(--acc);text-decoration:none}
+header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:10px;padding:12px 14px;background:linear-gradient(180deg,#1a212b,#141920);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:8px;font-weight:600;font-size:16px;flex:1;min-width:0}
+.brand .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.back{font-size:13px;color:var(--mut);border:1px solid var(--line);background:var(--card2);border-radius:999px;padding:6px 12px;white-space:nowrap}
+.btn{font-size:13px;color:var(--fg);border:1px solid var(--line);background:var(--card2);border-radius:8px;padding:7px 12px;cursor:pointer}
+.btn:active{background:var(--acc);border-color:var(--acc);color:#fff}
+.bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line);font-size:12px;color:var(--mut)}
+.bar select{background:var(--card2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(164px,1fr));gap:12px;padding:14px}
+@media(max-width:520px){.grid{grid-template-columns:repeat(auto-fill,minmax(142px,1fr));gap:10px;padding:10px}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column;cursor:pointer;transition:.15s}
+.card:hover{border-color:var(--acc);transform:translateY(-1px)}
+.thumb{position:relative;width:100%;aspect-ratio:16/10;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.thumb .ph{color:#4b5563;font-size:26px}
+.thumb .dur{position:absolute;right:6px;bottom:6px;background:rgba(0,0,0,.72);color:#fff;font-size:11px;border-radius:4px;padding:1px 5px;font-variant-numeric:tabular-nums}
+.meta{padding:8px 10px;display:flex;flex-direction:column;gap:3px}
+.meta .name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meta .sub{font-size:11px;color:var(--mut);display:flex;justify-content:space-between;gap:6px}
+.empty{padding:60px 20px;text-align:center;color:var(--mut);line-height:1.9}
+.empty .big{font-size:44px;margin-bottom:8px}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.82);display:none;align-items:center;justify-content:center;z-index:100;padding:16px}
+#modal.show{display:flex}
+.dlg{background:var(--card);border:1px solid var(--line);border-radius:14px;max-width:860px;width:100%;max-height:92vh;display:flex;flex-direction:column;overflow:hidden}
+.dlg .hd{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line)}
+.dlg .hd .ttl{flex:1;min-width:0;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dlg video{width:100%;max-height:60vh;background:#000;display:block}
+.dlg .ft{display:flex;flex-wrap:wrap;gap:8px;padding:12px 14px;border-top:1px solid var(--line);align-items:center}
+.sp{flex:1}
+.x{width:34px;height:34px;border-radius:50%;border:1px solid var(--line);background:var(--card2);color:var(--fg);font-size:16px;cursor:pointer;flex-shrink:0}
+.pbtn{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+.prog{display:flex;align-items:center;gap:10px;width:100%;font-size:12px;color:var(--mut)}
+.progbar{flex:1;height:8px;background:var(--card2);border:1px solid var(--line);border-radius:999px;overflow:hidden}
+.progbar i{display:block;height:100%;width:0;background:var(--acc);transition:width .15s}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);background:rgba(20,25,32,.96);color:#fff;border:1px solid var(--line);padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:.25s;z-index:200;max-width:84vw;text-align:center}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<header>
+<div class="brand"><span>&#128193;</span><span class="t" id="title">录像相册</span></div>
+<a class="back" href="/">&#9654; 实时画面</a>
+<button class="btn" id="btn-refresh">刷新</button>
+</header>
+<div class="bar">
+<span id="stat">加载中...</span>
+<span class="sp"></span>
+<span>分片大小</span>
+<select id="sel-chunk">
+<option value="1048576">1 MB</option>
+<option value="2097152" selected>2 MB</option>
+<option value="5242880">5 MB</option>
+<option value="10485760">10 MB</option>
+</select>
+</div>
+<div class="grid" id="grid"></div>
+<div id="modal">
+<div class="dlg">
+<div class="hd"><span class="ttl" id="m-title">--</span><button class="x" id="m-close">&#10005;</button></div>
+<video id="m-video" controls playsinline preload="metadata"></video>
+<div class="ft">
+<button class="btn pbtn" id="m-dl">&#11123; 下载</button>
+<button class="btn" id="m-chunk">&#9986; 分片下载</button>
+<button class="btn" id="m-copy">&#128279; 复制直连</button>
+<span class="sp"></span>
+<button class="btn" id="m-open">&#128065; 新窗口</button>
+</div>
+<div class="ft" id="m-progwrap" style="display:none">
+<div class="prog"><div class="progbar"><i id="m-progbar"></i></div><span id="m-progtxt">0%</span></div>
+</div>
+</div>
+</div>
+<div id="toast"></div>
+<script>
+var grid=document.getElementById('grid'),statEl=document.getElementById('stat'),toastEl=document.getElementById('toast');
+var modal=document.getElementById('modal'),mVideo=document.getElementById('m-video'),mTitle=document.getElementById('m-title');
+var progwrap=document.getElementById('m-progwrap'),progbar=document.getElementById('m-progbar'),progtxt=document.getElementById('m-progtxt');
+var selChunk=document.getElementById('sel-chunk');
+var files=[],curRel='';
+function toast(m){toastEl.textContent=m;toastEl.classList.add('show');clearTimeout(toastEl._t);toastEl._t=setTimeout(function(){toastEl.classList.remove('show');},2200);}
+function fmtSize(n){n=Number(n)||0;if(!n)return '0 B';var u=['B','KB','MB','GB'];var i=0;while(n>=1024&&i<u.length-1){n/=1024;i++;}return (i?n.toFixed(1):n)+' '+u[i];}
+function fmtDur(ms){ms=Number(ms)||0;if(ms<=0)return '--:--';var s=Math.round(ms/1000);var m=Math.floor(s/60);s=s%60;return (m<10?'0':'')+m+':'+(s<10?'0':'')+s;}
+function fmtTime(ts){var d=new Date(Number(ts)||0);function p(n){return (n<10?'0':'')+n;}return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}
+function esc(s){return String(s).replace(/[&<>"']/g,function(c){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];});}
+function load(){
+  statEl.textContent='加载中...';
+  fetch('/api/recordings',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    if(d&&d.error){statEl.textContent='错误: '+d.error;return;}
+    files=(d&&d.files)||[];
+    render();
+  }).catch(function(){statEl.textContent='加载失败，请刷新';});
+}
+function render(){
+  var tot=0;for(var t=0;t<files.length;t++)tot+=Number(files[t].size)||0;
+  statEl.textContent='共 '+files.length+' 个录像'+(files.length?('  ·  合计 '+fmtSize(tot)):'');
+  if(!files.length){grid.innerHTML='<div class="empty" style="grid-column:1/-1"><div class="big">&#127909;</div>暂无录像<br>可在实时画面点录像，或调用 API 录制</div>';return;}
+  var html='';
+  for(var i=0;i<files.length;i++){
+    var f=files[i];
+    html+='<div class="card" data-i="'+i+'">';
+    html+='<div class="thumb"><img loading="lazy" src="/thumb/'+encodeURI(f.relPath)+'" alt=""><span class="dur">'+fmtDur(f.durationMs)+'</span></div>';
+    html+='<div class="meta"><div class="name">'+esc(f.name)+'</div><div class="sub"><span>'+esc(f.date)+'</span><span>'+fmtTime(f.modified)+'</span></div><div class="sub"><span>'+fmtSize(f.size)+'</span></div></div>';
+    html+='</div>';
+  }
+  grid.innerHTML=html;
+  var cards=grid.querySelectorAll('.card');
+  for(var j=0;j<cards.length;j++){cards[j].addEventListener('click',function(){openPlayer(parseInt(this.getAttribute('data-i'),10));});}
+  var imgs=grid.querySelectorAll('.thumb img');
+  for(var k=0;k<imgs.length;k++){imgs[k].addEventListener('error',function(){this.style.visibility='hidden';});}
+}
+function openPlayer(i){
+  var f=files[i];if(!f)return;
+  curRel=f.relPath;
+  mTitle.textContent=f.name+'  ·  '+fmtSize(f.size)+'  ·  '+fmtDur(f.durationMs);
+  mVideo.src='/play/'+encodeURI(f.relPath);
+  progwrap.style.display='none';progbar.style.width='0';progtxt.textContent='0%';
+  modal.classList.add('show');
+  try{mVideo.play().catch(function(){});}catch(e){}
+}
+function closePlayer(){try{mVideo.pause();}catch(e){}mVideo.removeAttribute('src');try{mVideo.load();}catch(e){}modal.classList.remove('show');}
+function download(rel){var a=document.createElement('a');a.href='/dl/'+encodeURI(rel);a.download=(rel.split('/').pop()||'video.mp4');document.body.appendChild(a);a.click();a.remove();}
+function doChunkDownload(){
+  var rel=curRel;if(!rel)return;
+  var f=null;for(var i=0;i<files.length;i++){if(files[i].relPath===rel){f=files[i];break;}}
+  var name=(f&&f.name)||'video.mp4';
+  var total=(f&&Number(f.size))||0;
+  var chunk=parseInt(selChunk.value,10)||2097152;
+  if(!total){toast('文件大小未知');return;}
+  if(!window.showSaveFilePicker){toast('此浏览器不支持分片保存，改为普通下载');download(rel);return;}
+  window.showSaveFilePicker({suggestedName:name}).then(function(handle){return handle.createWritable();}).then(function(writable){
+    var start=0;
+    function step(){
+      if(start>=total){return writable.close().then(function(){toast('分片下载完成');});}
+      var end=Math.min(start+chunk,total)-1;
+      return fetch('/dl/'+encodeURI(rel),{headers:{'Range':'bytes='+start+'-'+end}}).then(function(resp){
+        if(resp.status!==206&&!resp.ok)throw new Error('HTTP '+resp.status);
+        return resp.arrayBuffer();
+      }).then(function(buf){
+        return writable.write(new Uint8Array(buf));
+      }).then(function(){
+        start=end+1;
+        var pct=Math.floor(start*100/total);
+        progbar.style.width=pct+'%';progtxt.textContent=pct+'%';
+        return step();
+      });
+    }
+    progwrap.style.display='flex';
+    return step();
+  }).catch(function(e){
+    if(e&&e.name==='AbortError'){progwrap.style.display='none';return;}
+    progwrap.style.display='none';
+    toast('分片下载中断: '+((e&&e.message)?e.message:e)+'（可重试）');
+  });
+}
+function copyText(t){if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){toast('已复制: '+t);},function(){toast(t);});}else{toast(t);}}
+function copyDirect(){
+  var rel=curRel;if(!rel)return;
+  fetch('/api/state',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    var ip=(d&&d.lanIp)||location.hostname;
+    copyText('http://'+ip+':8080/dl/'+encodeURI(rel));
+  }).catch(function(){copyText(location.origin+'/dl/'+encodeURI(rel));});
+}
+document.getElementById('btn-refresh').addEventListener('click',load);
+document.getElementById('m-close').addEventListener('click',closePlayer);
+modal.addEventListener('click',function(e){if(e.target===modal)closePlayer();});
+document.getElementById('m-dl').addEventListener('click',function(){if(curRel)download(curRel);});
+document.getElementById('m-chunk').addEventListener('click',doChunkDownload);
+document.getElementById('m-copy').addEventListener('click',copyDirect);
+document.getElementById('m-open').addEventListener('click',function(){if(curRel)window.open('/play/'+encodeURI(curRel),'_blank');});
+load();
+setInterval(load,15000);
 </script>
 </body>
 </html>
