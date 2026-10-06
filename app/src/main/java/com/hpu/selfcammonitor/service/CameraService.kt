@@ -11,11 +11,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.media.MediaMetadataRetriever
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -51,6 +53,7 @@ import com.hpu.selfcammonitor.utils.HlsManager
 import com.hpu.selfcammonitor.utils.MJPEGStreamer
 import com.hpu.selfcammonitor.utils.MotionDetector
 import com.hpu.selfcammonitor.ui.MainActivity
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -131,6 +134,15 @@ class CameraService : LifecycleService(), StreamControl {
 
     // 手动录像代数计数（同 clipGeneration 用途，防止旧会话事件影响新会话）
     private var manualGeneration = 0
+
+    // 手动录像定时停止（自定义录制时长）：<=0 表示不限时长
+    @Volatile private var manualDurationMs = 0L
+    private var manualStopRunnable: Runnable? = null
+
+    // 录像缩略图缓存（relPath -> jpeg 字节），避免反复解码
+    private val thumbCache = HashMap<String, ByteArray>()
+    private val thumbLock = Any()
+    @Volatile private var manualDurationSecCfg = 0
 
     // 分辨率格式校验（如 1280x720）
     private val resPattern = Regex("^\\d{3,4}x\\d{3,4}$")
@@ -447,6 +459,7 @@ class CameraService : LifecycleService(), StreamControl {
         // 停止网页端手动录像
         manualRecording = false
         manualGeneration++
+        cancelManualStopTimer()
         manualRecord?.stop()
         manualRecord = null
         streamServer.stop()
@@ -881,6 +894,8 @@ class CameraService : LifecycleService(), StreamControl {
         "hlsSegments" to hlsManager.segmentCount(),
         "hlsDvrSec" to 90,
         "audio" to audioActive,
+        "manualDurationSec" to manualDurationSecCfg,
+        "lanIp" to getLocalIpAddress(),
         "withinWindow" to isWithinTimeWindow(),
         "resolutions" to supportedResolutions(),
     )
@@ -969,13 +984,16 @@ class CameraService : LifecycleService(), StreamControl {
         return result
     }
 
-    override fun startManualRecording(): Boolean {
-        handler.post { startManualRecordingInternal() }
+    override fun startManualRecording(durationSec: Int): Boolean {
+        val ms = if (durationSec > 0) durationSec.toLong() * 1000L else 0L
+        manualDurationSecCfg = if (durationSec > 0) durationSec else 0
+        handler.post { startManualRecordingInternal(ms) }
         return true
     }
 
     override fun stopManualRecording(): Boolean {
         handler.post {
+            cancelManualStopTimer()
             if (!manualRecording && manualRecord == null) return@post
             manualRecording = false
             manualGeneration++  // 使旧会话的 Finalize 事件失效
@@ -993,13 +1011,20 @@ class CameraService : LifecycleService(), StreamControl {
         return true
     }
 
+    /** 取消定时自动停止录像 */
+    private fun cancelManualStopTimer() {
+        manualStopRunnable?.let { handler.removeCallbacks(it) }
+        manualStopRunnable = null
+    }
+
     /** 手动录像：仅预览模式下 videoCapture 为 null，需先重新绑定相机 */
-    private fun startManualRecordingInternal() {
+    private fun startManualRecordingInternal(durationMs: Long) {
         if (manualRecording) return
         if (!isRunning) {
             Log.w(TAG, "手动录像：服务未运行")
             return
         }
+        manualDurationMs = durationMs
         if (isRecording || continuousRecording) {
             // 手动录像独占 VideoCapture，先停掉模式化的录像会话
             stopMotionRecording()
@@ -1052,6 +1077,19 @@ class CameraService : LifecycleService(), StreamControl {
                 }
             }
         manualRecord = pending
+
+        // 自定义时长：定时自动停止
+        cancelManualStopTimer()
+        if (manualDurationMs > 0) {
+            val r = Runnable {
+                if (manualRecording) {
+                    Log.d(TAG, "手动录像达到设定时长 ${manualDurationMs}ms，自动停止")
+                    stopManualRecording()
+                }
+            }
+            manualStopRunnable = r
+            handler.postDelayed(r, manualDurationMs)
+        }
     }
 
     private fun isWithinTimeWindow(): Boolean {
@@ -1173,6 +1211,109 @@ class CameraService : LifecycleService(), StreamControl {
         val dailyDir = File(recordDir, dateStr)
         if (!dailyDir.exists()) dailyDir.mkdirs()
         return dailyDir
+    }
+
+    // ─── 录像库（相册 / 下载） ────────────────────────────────
+
+    /** 列出已保存录像（按修改时间倒序，最多 200 条） */
+    override fun listRecordings(): List<Map<String, Any?>> {
+        val out = ArrayList<Map<String, Any?>>()
+        try {
+            val base = recordDir
+            if (!base.isDirectory) return out
+            val files = ArrayList<File>()
+            base.listFiles()?.forEach { day ->
+                if (day.isDirectory) {
+                    day.listFiles()?.forEach { f ->
+                        if (f.isFile && f.name.endsWith(".mp4", ignoreCase = true)) files.add(f)
+                    }
+                }
+            }
+            files.sortByDescending { it.lastModified() }
+            for (f in files.take(200)) {
+                val rel = base.toURI().relativize(f.toURI()).path
+                val item = LinkedHashMap<String, Any?>()
+                item["relPath"] = rel
+                item["name"] = f.name
+                item["date"] = rel.substringBefore('/')
+                item["size"] = f.length()
+                item["modified"] = f.lastModified()
+                item["durationMs"] = probeDurationMs(f)
+                out.add(item)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "列出录像失败", e)
+        }
+        return out
+    }
+
+    private fun probeDurationMs(f: File): Long {
+        return try {
+            val r = MediaMetadataRetriever()
+            try {
+                r.setDataSource(f.absolutePath)
+                r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            } finally {
+                r.release()
+            }
+        } catch (e: Exception) {
+            0L
+        }
+    }
+
+    override fun recordingFile(relPath: String): File? {
+        return try {
+            val f = File(recordDir, relPath)
+            val canon = f.canonicalFile
+            val base = recordDir.canonicalFile
+            val basePath = base.path
+            if (canon.path != basePath && !canon.path.startsWith(basePath + File.separator)) return null
+            if (!canon.isFile) return null
+            canon
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    override fun recordingThumbnail(relPath: String): ByteArray? {
+        val f = recordingFile(relPath) ?: return null
+        val key = relPath + ":" + f.length()
+        synchronized(thumbLock) { thumbCache[key]?.let { return it } }
+        val bytes = try {
+            val r = MediaMetadataRetriever()
+            var bmp: Bitmap? = null
+            try {
+                r.setDataSource(f.absolutePath)
+                bmp = r.getFrameAtTime(1000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: r.frameAtTime
+            } finally {
+                r.release()
+            }
+            if (bmp == null) null else {
+                val scaled = scaleBitmapDown(bmp, 480)
+                val bos = ByteArrayOutputStream()
+                scaled.compress(Bitmap.CompressFormat.JPEG, 78, bos)
+                if (scaled !== bmp) scaled.recycle()
+                bmp.recycle()
+                bos.toByteArray()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "生成缩略图失败: $relPath", e)
+            null
+        }
+        if (bytes != null) {
+            synchronized(thumbLock) {
+                if (thumbCache.size > 200) thumbCache.clear()
+                thumbCache[key] = bytes
+            }
+        }
+        return bytes
+    }
+
+    private fun scaleBitmapDown(src: Bitmap, maxW: Int): Bitmap {
+        if (src.width <= maxW) return src
+        val h = (src.height.toLong() * maxW / src.width).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(src, maxW, h, true)
     }
 
     /**
