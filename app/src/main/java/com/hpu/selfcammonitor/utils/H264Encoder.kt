@@ -122,14 +122,14 @@ class H264Encoder(
     }
 
     /** 编码一帧 NV12。仅在调用线程（相机分析线程）内串行调用 */
-    fun encode(nv12: ByteArray, w: Int, h: Int) {
+    fun encode(nv12: ByteArray, w: Int, h: Int, ptsUs: Long) {
         val c = codec ?: return
         if (!isRunning || w != width || h != height) return
         try {
             if (keyframeReq.getAndSet(false)) requestSyncFrame()
             val inIdx = c.dequeueInputBuffer(10_000)
             if (inIdx >= 0) {
-                val pts = frameIndex * 1_000_000L / fps
+                val pts = ptsUs
                 var size = 0
                 if (useInputImage) {
                     val img = c.getInputImage(inIdx)
