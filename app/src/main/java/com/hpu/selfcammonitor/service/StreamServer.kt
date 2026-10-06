@@ -6,11 +6,13 @@ import java.io.PipedInputStream
 import java.io.PipedOutputStream
 import java.net.URLDecoder
 import android.util.Base64
+import com.hpu.selfcammonitor.utils.H264Streamer
 import com.hpu.selfcammonitor.utils.MJPEGStreamer
 
 class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
 
     private lateinit var mjpegStreamer: MJPEGStreamer
+    private lateinit var h264Streamer: H264Streamer
 
     var isMjpegEnabled: Boolean = true
 
@@ -23,6 +25,10 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
 
     fun setMJPEGStreamer(streamer: MJPEGStreamer) {
         this.mjpegStreamer = streamer
+    }
+
+    fun setH264Streamer(streamer: H264Streamer) {
+        this.h264Streamer = streamer
     }
 
     fun setControl(c: StreamControl) {
@@ -45,7 +51,7 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
             }
             val cred = String(
                 Base64.decode(auth.substring(6), Base64.DEFAULT)
-            ).split(":", limit = 2)  // limit=2：密码本身含":"时也能正确切分
+            ).split(":", limit = 2)
             if (cred.size != 2 || cred[0] != username || cred[1] != password) {
                 val res = newFixedLengthResponse(
                     Response.Status.UNAUTHORIZED, "text/plain", "认证失败"
@@ -57,6 +63,7 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
 
         return when (s.uri) {
             "/", "/index.html" -> htmlPage()
+            "/h264" -> serveH264()
             "/video" -> serveVideo()
             "/status" -> serveLegacyStatus()
             "/snapshot" -> serveSnapshot(download = false)
@@ -76,6 +83,17 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
         return res
     }
 
+    /** H.264 低延迟码流（长度前缀帧格式），网页端用 WebCodecs 硬件解码 */
+    private fun serveH264(): Response {
+        val pipedOut = PipedOutputStream()
+        val pipedIn = PipedInputStream(pipedOut, 1 shl 20)
+        h264Streamer.addClient(pipedOut)
+        val res = newChunkedResponse(Response.Status.OK, "application/octet-stream", pipedIn)
+        res.addHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+        res.addHeader("X-Accel-Buffering", "no")
+        return res
+    }
+
     private fun serveVideo(): Response {
         if (!isMjpegEnabled) {
             return newFixedLengthResponse(
@@ -83,8 +101,6 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
             )
         }
         val pipedOut = PipedOutputStream()
-        // 管道缓冲放大到 1MB（默认仅 1KB，高分辨率单帧 >100KB 会导致写线程频繁阻塞，
-        // 表现为画面卡顿/掉帧）
         val pipedIn = PipedInputStream(pipedOut, 1 shl 20)
         mjpegStreamer.addClient(pipedOut)
         val res = newChunkedResponse(
@@ -92,7 +108,6 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
             "multipart/x-mixed-replace; boundary=${MJPEGStreamer.Companion.BOUNDARY}",
             pipedIn
         )
-        // 关闭代理/CDN 缓冲，尽量让 MJPEG 逐帧低延迟下发
         res.addHeader("Cache-Control", "no-store, no-cache, must-revalidate")
         res.addHeader("Pragma", "no-cache")
         res.addHeader("X-Accel-Buffering", "no")
@@ -147,11 +162,6 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
     }
 
     private fun serveSnapshot(download: Boolean): Response {
-        if (!isMjpegEnabled) {
-            return newFixedLengthResponse(
-                Response.Status.SERVICE_UNAVAILABLE, "text/plain", "推流已关闭"
-            )
-        }
         val jpeg = mjpegStreamer.getLatestJpeg()
             ?: return newFixedLengthResponse(
                 Response.Status.SERVICE_UNAVAILABLE, "text/plain", "暂无画面"
@@ -265,9 +275,11 @@ header{display:flex;align-items:center;gap:10px;padding:10px 14px;background:lin
 .badges{display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end}
 .badge{font-size:11px;color:var(--mut);background:var(--card2);border:1px solid var(--line);border-radius:999px;padding:3px 9px;white-space:nowrap}
 .badge.rec{color:#fff;background:var(--err);border-color:var(--err);animation:pulse 1.2s infinite}
+.badge.proto{color:#93c5fd;border-color:#3b82f6}
 main{flex:1;display:flex;flex-direction:column;min-height:0}
 #stage{position:relative;flex:1;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000;touch-action:none}
-#img{display:block;max-width:100%;max-height:100%;object-fit:contain;-webkit-user-drag:none;user-select:none;transform-origin:center center;will-change:transform}
+#img,#canvas{display:block;max-width:100%;max-height:100%;object-fit:contain;-webkit-user-drag:none;user-select:none;transform-origin:center center;will-change:transform}
+#canvas{display:none}
 #overlay{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:#7c8798;font-size:15px;display:none;z-index:5}
 #overlay.show{display:block}
 .vtoolbar{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);display:flex;gap:8px;z-index:6}
@@ -304,16 +316,17 @@ main{flex-direction:row}
 <header>
 <div class="brand"><span class="dot connecting" id="dot"></span><span class="t" id="title">SelfCamMonitor</span></div>
 <div class="badges">
+<span class="badge proto" id="b-proto">--</span>
 <span class="badge" id="b-fps">-- fps</span>
 <span class="badge" id="b-net">-- MB/s</span>
 <span class="badge" id="b-res">--</span>
-<span class="badge" id="b-face">--</span>
 <span class="badge rec" id="b-rec" style="display:none">录制中</span>
 </div>
 </header>
 <main>
 <div id="stage">
 <img id="img" alt="监控画面" draggable="false">
+<canvas id="canvas"></canvas>
 <div id="overlay"></div>
 <div class="vtoolbar">
 <button class="iconbtn" id="btn-r" title="旋转">&#8635;</button>
@@ -326,25 +339,29 @@ main{flex-direction:row}
 <div class="prow"><label class="k">分辨率</label><select id="sel-res"></select></div>
 <div class="prow"><label class="k">帧率</label><input id="rng-fps" type="range" min="1" max="30" step="1" value="16"><span class="val" id="lbl-fps">16 fps</span></div>
 <div class="prow"><label class="k">摄像头</label><select id="sel-face"><option value="0">后置</option><option value="1">前置</option></select></div>
-<div class="prow"><label class="k">推流</label><label class="switch"><input id="sw-mjpeg" type="checkbox"><span></span></label><span class="val" id="lbl-mjpeg">开启</span></div>
 <div class="prow"><label class="k">录像模式</label><select id="sel-mode"><option value="2">仅预览</option><option value="0">连续录像</option><option value="1">运动触发</option></select></div>
+<div class="prow"><label class="k">MJPEG</label><label class="switch"><input id="sw-mjpeg" type="checkbox"><span></span></label><span class="val" id="lbl-mjpeg">开启</span></div>
 <div class="pinfo" id="pinfo"></div>
 </aside>
 </main>
 <div id="toast"></div>
 <script>
-var img=document.getElementById('img'),stage=document.getElementById('stage'),
+var img=document.getElementById('img'),canvas=document.getElementById('canvas'),
+ctx=canvas.getContext('2d'),stage=document.getElementById('stage'),
 dot=document.getElementById('dot'),ov=document.getElementById('overlay');
 var selRes=document.getElementById('sel-res'),rngFps=document.getElementById('rng-fps'),
 lblFps=document.getElementById('lbl-fps'),selFace=document.getElementById('sel-face'),
 swMjpeg=document.getElementById('sw-mjpeg'),lblMjpeg=document.getElementById('lbl-mjpeg'),
 selMode=document.getElementById('sel-mode'),btnRec=document.getElementById('btn-rec'),
-bFps=document.getElementById('b-fps'),bNet=document.getElementById('b-net'),bRes=document.getElementById('b-res'),
-bFace=document.getElementById('b-face'),bRec=document.getElementById('b-rec'),
+bFps=document.getElementById('b-fps'),bNet=document.getElementById('b-net'),
+bRes=document.getElementById('b-res'),bRec=document.getElementById('b-rec'),
+bProto=document.getElementById('b-proto'),
 pinfo=document.getElementById('pinfo'),toastEl=document.getElementById('toast');
 var HI=2000;
+var activeEl=img;
 var rot=0,zoom=1,panX=0,panY=0,stat='connecting',wantStream=true,reloadTimer=null;
-var resFilled=false,userRec=false,firstLoad=false;
+var resFilled=false,userRec=false,firstLoad=false,lastState=null;
+var mode='mjpeg',decoder=null,configuredCodec=null,decodeSeq=0,h264Abort=null,h264Failed=false,h264Timer=null;
 function setStatus(s){
   stat=s;dot.className='dot '+s;
   var t={connecting:'连接中...',live:'已连接',disconnected:'已断开，正在重连...',off:'推流已关闭'};
@@ -356,17 +373,17 @@ function toast(msg){
   clearTimeout(toastEl._t);toastEl._t=setTimeout(function(){toastEl.classList.remove('show');},1800);
 }
 function applyTransform(){
-  img.style.transform='translate('+panX+'px,'+panY+'px) rotate('+rot+'deg) scale('+zoom+')';
+  activeEl.style.transform='translate('+panX+'px,'+panY+'px) rotate('+rot+'deg) scale('+zoom+')';
 }
 function fit(){
   var sw=stage.clientWidth,sh=stage.clientHeight;
-  if(rot%180===0){img.style.maxWidth='100%';img.style.maxHeight='100%';}
-  else{img.style.maxWidth=sh+'px';img.style.maxHeight=sw+'px';}
+  if(rot%180===0){activeEl.style.maxWidth='100%';activeEl.style.maxHeight='100%';}
+  else{activeEl.style.maxWidth=sh+'px';activeEl.style.maxHeight=sw+'px';}
 }
 function doRotate(){
-  img.style.transition='transform .3s ease';
+  activeEl.style.transition='transform .3s ease';
   rot=(rot+90)%360;zoom=1;panX=0;panY=0;fit();applyTransform();
-  setTimeout(function(){img.style.transition='none';},350);
+  setTimeout(function(){activeEl.style.transition='none';},350);
 }
 var MIN_Z=1,MAX_Z=5;
 function clampZ(v){return Math.max(MIN_Z,Math.min(MAX_Z,v));}
@@ -393,13 +410,14 @@ window.addEventListener('mousemove',function(e){if(mousing){panX+=e.clientX-mx;p
 window.addEventListener('mouseup',function(){mousing=false;});
 stage.addEventListener('dblclick',function(){if(zoom>1.01){zoom=1;panX=0;panY=0;}else{zoom=2;}applyTransform();});
 function reload(){
+  if(mode!=='mjpeg')return;
   if(!wantStream){img.removeAttribute('src');return;}
   clearTimeout(reloadTimer);
   img.src='/video?t='+Date.now();
 }
-img.addEventListener('load',function(){firstLoad=true;setStatus('live');});
+img.addEventListener('load',function(){if(mode!=='mjpeg')return;firstLoad=true;setStatus('live');});
 img.addEventListener('error',function(){
-  if(!wantStream)return;
+  if(mode!=='mjpeg'||!wantStream)return;
   setStatus('connecting');
   clearTimeout(reloadTimer);reloadTimer=setTimeout(reload,1500);
 });
@@ -408,17 +426,17 @@ function toggleFs(){
   if(!fs){if(e.requestFullscreen)e.requestFullscreen();else if(e.webkitRequestFullscreen)e.webkitRequestFullscreen();}
   else{if(document.exitFullscreen)document.exitFullscreen();else if(document.webkitExitFullscreen)document.webkitExitFullscreen();}
 }
+function api(path){return fetch(path,{cache:'no-store'}).then(function(r){return r.json();});}
 function fmtRate(bps){
   var mb=bps/1048576;
   return mb.toFixed(2)+' MB/s';
 }
-function api(path){return fetch(path,{cache:'no-store'}).then(function(r){return r.json();});}
 function refresh(d){
   if(!d||d.error)return;
+  lastState=d;
   bFps.textContent=(d.currentFps||0)+' fps';
   if(typeof d.netRateBps==='number')bNet.textContent=fmtRate(d.netRateBps);
   bRes.textContent=d.resolution||'--';
-  bFace.textContent=(d.facing===1?'前置':'后置');
   if(!resFilled&&d.resolutions&&d.resolutions.length){
     resFilled=true;
     d.resolutions.forEach(function(r){var o=document.createElement('option');o.value=r;o.textContent=r;selRes.appendChild(o);});
@@ -433,11 +451,12 @@ function refresh(d){
   btnRec.classList.toggle('on',userRec);
   btnRec.innerHTML=userRec?'&#9632;':'&#9679;';
   bRec.style.display=(d.manualRecording||d.recording)?'':'none';
+  bProto.textContent=(mode==='h264'?'H.264':'MJPEG');
   var parts=[];
   parts.push('模式: '+(d.modeLabel||'--'));
+  if(typeof d.h264Bitrate==='number'&&d.h264Bitrate>0)parts.push('编码: '+(d.h264Bitrate/1000000).toFixed(1)+'Mbps');
   if(typeof d.clientCount==='number')parts.push('观看: '+d.clientCount);
   if(typeof d.netRateBps==='number')parts.push('网络: '+fmtRate(d.netRateBps));
-  if(typeof d.lastFrameAge==='number'&&d.lastFrameAge<900000)parts.push('画面延迟: '+d.lastFrameAge+'ms');
   pinfo.textContent=parts.join('  ·  ');
 }
 function applyConfig(params,msg){
@@ -459,9 +478,108 @@ function snapshot(){
   a.href='/api/snapshot?t='+Date.now();a.download='snapshot.jpg';
   document.body.appendChild(a);a.click();a.remove();toast('已保存截图');
 }
+// ── H.264 / WebCodecs 播放 ──
+function initDecoder(){
+  var codecStr=lastState&&lastState.h264Codec;
+  if(!codecStr)return false;
+  try{
+    if(decoder){try{decoder.close();}catch(_){}decoder=null;}
+    decoder=new VideoDecoder({output:onDecoded,error:function(e){onH264Err(e);}});
+    decoder.configure({codec:codecStr,optimizeForLatency:true});
+    configuredCodec=codecStr;
+    return true;
+  }catch(e){decoder=null;return false;}
+}
+function feedUnit(data,key){
+  if(!decoder||configuredCodec!==(lastState&&lastState.h264Codec)){if(!initDecoder())return;}
+  if(decoder.decodeQueueSize>8&&!key)return;
+  try{decoder.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:decodeSeq++,data:data}));}catch(e){onH264Err(e);}
+}
+function onDecoded(frame){
+  try{
+    if(canvas.width!==frame.displayWidth||canvas.height!==frame.displayHeight){canvas.width=frame.displayWidth;canvas.height=frame.displayHeight;}
+    ctx.drawImage(frame,0,0,canvas.width,canvas.height);
+  }finally{frame.close();}
+  if(stat!=='live'){firstLoad=true;setStatus('live');}
+}
+function onH264Err(e){
+  if(mode!=='h264')return;
+  h264Failed=true;
+  if(h264Abort)try{h264Abort.abort();}catch(_){}
+  try{if(decoder)decoder.close();}catch(_){}
+  decoder=null;
+  toast('H.264 解码不可用，切换到 MJPEG');
+  startMjpeg();
+}
+function openH264(){
+  if(h264Abort)try{h264Abort.abort();}catch(_){}
+  h264Abort=new AbortController();
+  fetch('/h264',{cache:'no-store',signal:h264Abort.signal}).then(function(resp){
+    if(!resp.ok||!resp.body)throw new Error('http '+resp.status);
+    var reader=resp.body.getReader();
+    var acc=new Uint8Array(1<<16),accLen=0;
+    function pump(){
+      reader.read().then(function(r){
+        if(r.done)throw new Error('closed');
+        var v=r.value;
+        if(accLen+v.length>acc.length){var n=new Uint8Array(Math.max(acc.length*2,accLen+v.length));n.set(acc.subarray(0,accLen));acc=n;}
+        acc.set(v,accLen);accLen+=v.length;
+        var off=0;
+        while(accLen-off>=5){
+          var len=((acc[off]<<24)|(acc[off+1]<<16)|(acc[off+2]<<8)|acc[off+3])>>>0;
+          if(accLen-off-5<len)break;
+          var key=(acc[off+4]&1)===1;
+          var payload=acc.slice(off+5,off+5+len);
+          feedUnit(payload,key);
+          off+=5+len;
+        }
+        if(off>0){acc.copyWithin(0,off,accLen);accLen-=off;}
+        pump();
+      }).catch(function(e){if(e&&e.name==='AbortError')return;onH264Err(e);});
+    }
+    pump();
+  }).catch(function(e){if(e&&e.name==='AbortError')return;onH264Err(e);});
+}
+function startH264(){
+  mode='h264';
+  img.style.display='none';canvas.style.display='block';activeEl=canvas;
+  setStatus('connecting');
+  img.removeAttribute('src');
+  bProto.textContent='H.264';
+  openH264();
+  clearTimeout(h264Timer);
+  h264Timer=setTimeout(function(){
+    if(mode==='h264'&&(!decoder||stat!=='live')){toast('H.264 无响应，切换到 MJPEG');startMjpeg();}
+  },6000);
+}
+function startMjpeg(){
+  mode='mjpeg';
+  if(h264Abort)try{h264Abort.abort();}catch(_){}
+  try{if(decoder)decoder.close();}catch(_){}
+  decoder=null;
+  canvas.style.display='none';img.style.display='block';activeEl=img;
+  bProto.textContent='MJPEG';
+  setStatus('connecting');
+  reload();
+}
+function chooseMode(){
+  api('/api/state').then(function(d){
+    lastState=d;
+    if(!h264Failed&&('VideoDecoder' in window)&&d.h264Enabled){
+      startH264();
+    }else{
+      startMjpeg();
+    }
+  }).catch(function(){startMjpeg();});
+}
 function heartbeat(){
   api('/api/state').then(function(d){
     refresh(d);
+    if(mode==='h264'){
+      if(d.h264Enabled===false){startMjpeg();return;}
+      if(!d.h264Ready&&stat!=='live'){/* 等编码器就绪 */}
+      return;
+    }
     if(d&&d.mjpegEnabled===false){
       if(wantStream){wantStream=false;img.removeAttribute('src');}
       setStatus('off');
@@ -478,7 +596,7 @@ document.getElementById('btn-r').addEventListener('click',doRotate);
 document.getElementById('btn-fs').addEventListener('click',toggleFs);
 document.getElementById('btn-shot').addEventListener('click',snapshot);
 btnRec.addEventListener('click',toggleRec);
-selRes.addEventListener('change',function(){applyConfig({resolution:selRes.value},'分辨率将重启相机生效');});
+selRes.addEventListener('change',function(){applyConfig({resolution:selRes.value},'分辨率将重启相机生效');resFilled=false;});
 selFace.addEventListener('change',function(){resFilled=false;selRes.innerHTML='';applyConfig({facing:selFace.value},'已切换摄像头');});
 selMode.addEventListener('change',function(){applyConfig({mode:selMode.value},'已切换录像模式');});
 var fpsTimer=null;
@@ -488,15 +606,12 @@ rngFps.addEventListener('change',function(){
   fpsTimer=setTimeout(function(){applyConfig({fps:rngFps.value},'帧率已设为 '+rngFps.value);},350);
 });
 swMjpeg.addEventListener('change',function(){
-  wantStream=swMjpeg.checked;
-  if(!wantStream)img.removeAttribute('src');
-  applyConfig({mjpeg:swMjpeg.checked?'1':'0'},swMjpeg.checked?'已开启推流':'已关闭推流');
-  if(wantStream){setStatus('connecting');reload();}
+  applyConfig({mjpeg:swMjpeg.checked?'1':'0'},swMjpeg.checked?'已开启 MJPEG':'已关闭 MJPEG');
 });
 window.addEventListener('resize',function(){fit();applyTransform();});
 document.addEventListener('fullscreenchange',function(){fit();applyTransform();});
 document.addEventListener('webkitfullscreenchange',function(){fit();applyTransform();});
-setStatus('connecting');reload();
+chooseMode();
 heartbeat();
 setInterval(heartbeat,HI);
 </script>
