@@ -52,6 +52,12 @@ object EdgeDiscovery {
         "198.41.200.23", "198.41.200.233", "198.41.200.43", "198.41.200.73",
     )
 
+    /** 已知的边缘主机名（无需 SRV，直接用系统解析 A 记录） */
+    private val REGION_HOSTS = listOf(
+        "region1.v2.argotunnel.com",
+        "region2.v2.argotunnel.com",
+    )
+
     /**
      * 返回形如 ["198.41.192.77:7844", ...] 的边缘地址列表。**保证非空**（最终回退种子 IP）。
      */
@@ -67,7 +73,18 @@ object EdgeDiscovery {
             Log.w(TAG, "DoH 发现失败: ${e.message}")
         }
 
-        // 2) 原生 DNS
+        // 2) 直接用系统解析器解析已知边缘主机（不依赖 SRV）
+        try {
+            val viaHost = discoverViaRegionHosts()
+            if (viaHost.isNotEmpty()) {
+                Log.i(TAG, "主机名解析发现边缘地址: ${viaHost.joinToString(",")}")
+                return viaHost
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "主机名解析失败: ${e.message}")
+        }
+
+        // 3) 原生 DNS（SRV）
         try {
             val servers = LinkedHashSet<String>()
             servers.addAll(systemDns)
@@ -81,10 +98,27 @@ object EdgeDiscovery {
             Log.w(TAG, "原生 DNS 发现失败: ${e.message}")
         }
 
-        // 3) 种子兜底
+        // 4) 种子兜底
         val seeds = SEED_EDGES.map { "$it:$EDGE_PORT" }
         Log.w(TAG, "使用内置边缘地址兜底: ${seeds.joinToString(",")}")
         return seeds
+    }
+
+    /** 直接用系统解析器解析 region1/region2 主机名（大多数 Android 网络下最可靠） */
+    private fun discoverViaRegionHosts(): List<String> {
+        val out = LinkedHashSet<String>()
+        for (host in REGION_HOSTS) {
+            try {
+                val addrs = InetAddress.getAllByName(host)
+                val v4 = addrs.filterIsInstance<Inet4Address>().mapNotNull { it.hostAddress }
+                val v6 = addrs.filter { it !is Inet4Address }.mapNotNull { it.hostAddress }
+                val picked = if (v4.isNotEmpty()) v4 else v6
+                for (ip in picked) out.add(formatAddr(ip, EDGE_PORT))
+            } catch (e: Exception) {
+                Log.w(TAG, "解析 $host 失败: ${e.message}")
+            }
+        }
+        return out.toList()
     }
 
     // ─── DoH ─────────────────────────────────────────────────────
