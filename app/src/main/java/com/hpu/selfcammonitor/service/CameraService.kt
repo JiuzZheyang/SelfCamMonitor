@@ -45,6 +45,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import com.hpu.selfcammonitor.manager.AlertManager
+import com.hpu.selfcammonitor.utils.AudioStreamer
 import com.hpu.selfcammonitor.utils.H264Encoder
 import com.hpu.selfcammonitor.utils.HlsManager
 import com.hpu.selfcammonitor.utils.MJPEGStreamer
@@ -79,6 +80,11 @@ class CameraService : LifecycleService(), StreamControl {
     @Volatile private var h264Height = 0
     @Volatile private var h264Bitrate = 0
     private var h264LastStartAttempt = 0L
+
+    // 音频推流（麦克风 → AAC → TS）
+    @Volatile private var audioStreamer: AudioStreamer? = null
+    @Volatile private var audioActive = false
+    @Volatile private var streamEpochUs = 0L
 
     private val motionDetector = MotionDetector()
     private val alertManager = AlertManager()
@@ -645,7 +651,8 @@ class CameraService : LifecycleService(), StreamControl {
                             if (hlsManager.consumeKeyframeRequestIfAny()) enc.requestKeyFrame()
                             val nv12 = MJPEGStreamer.yuv420888ToNv12(imageProxy)
                             if (nv12 != null) {
-                                enc.encode(nv12, fw, fh)
+                                val ptsUs = System.nanoTime() / 1000 - streamEpochUs
+                                enc.encode(nv12, fw, fh, ptsUs)
                                 updateFps()
                             }
                         }
@@ -873,6 +880,7 @@ class CameraService : LifecycleService(), StreamControl {
         "h264Bitrate" to h264Bitrate,
         "hlsSegments" to hlsManager.segmentCount(),
         "hlsDvrSec" to 90,
+        "audio" to audioActive,
         "withinWindow" to isWithinTimeWindow(),
         "resolutions" to supportedResolutions(),
     )
@@ -1343,6 +1351,9 @@ class CameraService : LifecycleService(), StreamControl {
     private fun startH264Encoder(w: Int, h: Int, rotation: Int) {
         if (w <= 0 || h <= 0) return
         stopH264Encoder()
+        hlsManager.reset()  // 编码器重启 → 清掉旧时间线的分片（PTS 单调，避免 MSE 倒退）
+        if (streamEpochUs == 0L) streamEpochUs = System.nanoTime() / 1000
+        startAudioIfPossible()  // 在写 PMT 前决定是否带音轨，保证整段流一致
         val fps = targetFps.coerceIn(1, 30)
         // 码率约为 0.07 bit/像素/帧（1080p@15 ≈ 2.2Mbps），钳制在 1.5~8 Mbps
         val bitrate = (w.toLong() * h * fps * 0.07).toInt().coerceIn(1_500_000, 8_000_000)
@@ -1359,6 +1370,35 @@ class CameraService : LifecycleService(), StreamControl {
         }
     }
 
+    private fun startAudioIfPossible() {
+        hlsManager.setAudioEnabled(false)
+        audioActive = false
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.d(TAG, "无录音权限，音频推流不启用")
+            return
+        }
+        val st = AudioStreamer(streamEpochUs) { adts, ptsUs ->
+            hlsManager.feedAudio(adts, ptsUs * 9 / 100)
+        }
+        if (st.start()) {
+            audioStreamer = st
+            audioActive = true
+            hlsManager.setAudioEnabled(true)
+            Log.d(TAG, "音频推流已启用")
+        } else {
+            Log.w(TAG, "音频推流启动失败（不影响视频）")
+        }
+    }
+
+    private fun stopAudio() {
+        audioStreamer?.stop()
+        audioStreamer = null
+        audioActive = false
+        if (::hlsManager.isInitialized) hlsManager.setAudioEnabled(false)
+    }
+
     private fun stopH264Encoder() {
         h264Encoder?.stop()
         h264Encoder = null
@@ -1366,6 +1406,7 @@ class CameraService : LifecycleService(), StreamControl {
         h264Width = 0
         h264Height = 0
         h264Bitrate = 0
+        stopAudio()
     }
 
     private fun updateFps() {
