@@ -162,7 +162,9 @@ class TunnelService : Service() {
     override fun onCreate() {
         super.onCreate()
         instance = this
-        executor = Executors.newSingleThreadExecutor()
+        // 多线程池：每种隧道的日志读取是阻塞循环，会占住线程直到进程结束；
+        // 若用单线程池，先启动的隧道会永久占住唯一线程，导致另一种隧道无法启动。
+        executor = Executors.newCachedThreadPool()
         createNotificationChannel()
     }
 
@@ -557,6 +559,7 @@ class TunnelService : Service() {
     }
 
     /** 确保本地 DNS 中继已启动（幂等） */
+    @Synchronized
     private fun ensureDnsForwarder() {
         if (dnsForwarder?.isRunning == true) return
         val forwarder = LocalDnsForwarder(systemDnsServers())
