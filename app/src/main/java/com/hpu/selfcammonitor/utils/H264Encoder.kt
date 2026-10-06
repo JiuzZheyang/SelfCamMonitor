@@ -76,7 +76,7 @@ class H264Encoder(
             codec = c
             this.width = w
             this.height = h
-            this.fps = targetFps.coerceIn(1, 30)
+            this.fps = targetFps.coerceIn(1, 60)
             frameIndex = 0
             spsPps = null
             codecString = null
@@ -94,7 +94,7 @@ class H264Encoder(
         val format = MediaFormat.createVideoFormat(MIME, w, h)
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, cf)
         format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate.coerceAtLeast(500_000))
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, targetFps.coerceIn(1, 30))
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, targetFps.coerceIn(1, 60))
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)  // 每秒一个关键帧
         if (withBitrateMode) {
             try {
