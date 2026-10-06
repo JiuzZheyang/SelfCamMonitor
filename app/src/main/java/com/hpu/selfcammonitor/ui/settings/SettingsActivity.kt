@@ -52,6 +52,8 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var etEndTime: EditText
     private lateinit var etUsername: EditText
     private lateinit var etPassword: EditText
+    private lateinit var etReserveMb: EditText
+    private lateinit var switchOnDemand: SwitchMaterial
 
     // 内网穿透
     private lateinit var switchTunnelAutoStart: SwitchMaterial
@@ -112,6 +114,8 @@ class SettingsActivity : AppCompatActivity() {
         etEndTime = findViewById(R.id.etEndTime)
         etUsername = findViewById(R.id.etUsername)
         etPassword = findViewById(R.id.etPassword)
+        etReserveMb = findViewById(R.id.etReserveMb)
+        switchOnDemand = findViewById(R.id.switchOnDemand)
         spinnerMotionDuration = findViewById(R.id.spinner_motion_duration)
         spinnerMotionDuration.setAdapter(
             ArrayAdapter(
@@ -371,6 +375,8 @@ class SettingsActivity : AppCompatActivity() {
         etEndTime.setText(prefs.getString("monitor_end", ""))
         etUsername.setText(prefs.getString("http_user", ""))
         etPassword.setText(prefs.getString("http_pass", ""))
+        etReserveMb.setText(prefs.getInt("record_reserve_mb", 0).toString())
+        setSwitchChecked(switchOnDemand, prefs.getBoolean("ondemand_camera", false))
 
         // 加载运动录像时长（秒）
         val motionSec = prefs.getInt("motion_clip_sec", CameraService.Companion.DEFAULT_MOTION_CLIP_SEC)
@@ -536,6 +542,13 @@ class SettingsActivity : AppCompatActivity() {
             prefs.edit().putBoolean("motion_alert_enabled", isChecked).apply()
             sendReloadBroadcast()
         }
+
+        // 按需启动摄像头：即时保存并热生效
+        switchOnDemand.setOnCheckedChangeListener { _, isChecked ->
+            if (suppressToggle) return@setOnCheckedChangeListener
+            prefs.edit().putBoolean("ondemand_camera", isChecked).apply()
+            sendReloadBroadcast()
+        }
     }
 
     /**
@@ -628,6 +641,8 @@ class SettingsActivity : AppCompatActivity() {
             .putString("monitor_end", etEndTime.text.toString().trim())
             .putString("http_user", etUsername.text.toString().trim())
             .putString("http_pass", etPassword.text.toString().trim())
+            .putInt("record_reserve_mb", etReserveMb.text.toString().toIntOrNull()?.coerceIn(0, 1_000_000) ?: 0)
+            .putBoolean("ondemand_camera", switchOnDemand.isChecked)
             .putInt("motion_clip_sec", motionSec)
             .putInt("continuous_segment_sec", continuousSec)
             .apply()

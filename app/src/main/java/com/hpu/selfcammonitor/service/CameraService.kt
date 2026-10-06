@@ -23,6 +23,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.StatFs
 import android.util.Log
 import android.util.Range
 import android.util.Size
@@ -143,6 +144,26 @@ class CameraService : LifecycleService(), StreamControl {
     private val thumbCache = HashMap<String, ByteArray>()
     private val thumbLock = Any()
     @Volatile private var manualDurationSecCfg = 0
+
+    // ── 存储配额与精选 ──
+    // 预留可用空间（MB）：可用空间低于该值时，按最早修改时间自动删除「未精选」录像
+    @Volatile private var reserveMbCfg = 0
+    private val cleanerHandler = Handler(Looper.getMainLooper())
+    private var cleanRunnable: Runnable? = null
+    private var demandRunnable: Runnable? = null
+    @Volatile private var lastCleanAt = 0L
+    @Volatile private var lastAutoDeleted = 0
+    private val starLock = Any()
+    private var starSet: MutableSet<String>? = null
+    @Volatile private var cachedRecBytes = 0L
+    @Volatile private var cachedRecBytesAt = 0L
+
+    // ── 按需摄像头（省电）：无客户端且无录像任务时释放摄像头 ──
+    @Volatile private var ondemandCamera = false
+    @Volatile private var cameraDemandUntilMs = 0L   // API 唤醒到期时间
+    @Volatile private var cameraStarting = false
+    @Volatile private var cameraStartAt = 0L
+    @Volatile private var lastDemandMs = 0L
 
     // 分辨率格式校验（如 1280x720）
     private val resPattern = Regex("^\\d{3,4}x\\d{3,4}$")
@@ -274,6 +295,28 @@ class CameraService : LifecycleService(), StreamControl {
 
         loadSettings()
         startEncodeLoop()
+        startMaintenanceLoops()
+    }
+
+    /** 周期维护：存储配额清理 + 按需摄像头调度 */
+    private fun startMaintenanceLoops() {
+        val cr = object : Runnable {
+            override fun run() {
+                enforceStorageQuota()
+                cleanerHandler.postDelayed(this, 60_000L)
+            }
+        }
+        cleanRunnable = cr
+        cleanerHandler.postDelayed(cr, 15_000L)
+
+        val dr = object : Runnable {
+            override fun run() {
+                evaluateCameraDemand()
+                cleanerHandler.postDelayed(this, 4_000L)
+            }
+        }
+        demandRunnable = dr
+        cleanerHandler.postDelayed(dr, 4_000L)
     }
 
     // 编码循环：持续取最新帧做旋转+JPEG 编码并推送。
@@ -347,6 +390,12 @@ class CameraService : LifecycleService(), StreamControl {
 
         // 镜头选择（0=后置，1=前置）；与分辨率/帧率一样，启动相机时生效
         useFrontCamera = prefs.getInt("camera_facing", 0) == 1
+
+        // 存储配额：预留可用空间（MB），0=不限（不自动清理）
+        reserveMbCfg = prefs.getInt("record_reserve_mb", 0).coerceIn(0, 1_000_000)
+
+        // 按需摄像头：无客户端且无录像任务时释放摄像头以省电
+        ondemandCamera = prefs.getBoolean("ondemand_camera", false)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -434,6 +483,15 @@ class CameraService : LifecycleService(), StreamControl {
                 }
             }
             Log.d(TAG, "配置已更新: mode=$recordMode, motionClip=${motionClipDurationMs}ms, continuousSegment=${continuousSegmentDurationMs}ms")
+
+            // 按需摄像头开关变化：关闭时若相机曾因省电被解绑，立即恢复常驻
+            if (!ondemandCamera && !cameraBound && !cameraStarting && isRunning) {
+                Log.d(TAG, "按需摄像头已关闭，恢复常驻相机")
+                startCamera()
+            } else if (ondemandCamera) {
+                // 开启按需时立即评估一次（可能马上解绑以省电）
+                lastDemandMs = System.currentTimeMillis()
+            }
         }
     }
 
@@ -453,6 +511,9 @@ class CameraService : LifecycleService(), StreamControl {
         super.onDestroy()
         isRunning = false
         instance = null
+        cleanRunnable?.let { cleanerHandler.removeCallbacks(it) }
+        demandRunnable?.let { cleanerHandler.removeCallbacks(it) }
+        cleanerHandler.removeCallbacksAndMessages(null)
         sendStatusBroadcast(false)  // 通知主界面更新状态（原实现停止时无广播，界面一直显示"运行中"）
         stopContinuousRecording()
         stopMotionRecording()
@@ -536,6 +597,9 @@ class CameraService : LifecycleService(), StreamControl {
     }
 
     private fun startCamera() {
+        if (cameraStarting) return
+        cameraStarting = true
+        cameraStartAt = System.currentTimeMillis()
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             cameraProvider = cameraProviderFuture.get()
@@ -743,6 +807,8 @@ class CameraService : LifecycleService(), StreamControl {
                     }
                 }
                 cameraBound = true
+                cameraStarting = false
+                lastDemandMs = System.currentTimeMillis()
                 Log.d(TAG, "相机绑定成功")
 
                 // 绑定成功后根据模式启动连续录像
@@ -756,8 +822,10 @@ class CameraService : LifecycleService(), StreamControl {
             } catch (e: Exception) {
                 Log.e(TAG, "相机绑定失败", e)
                 cameraBound = false
+                cameraStarting = false
                 sendStatusBroadcast(false)  // 通知主界面更新状态（原实现停止时无广播，界面一直显示"运行中"）
-                stopSelf()
+                // 按需模式下仅记录，稍后自动重试；常驻模式仍保持原行为（避免死循环）
+                if (!ondemandCamera) stopSelf()
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -901,6 +969,10 @@ class CameraService : LifecycleService(), StreamControl {
         "cfRunning" to TunnelService.isTunnelRunning(TunnelService.TYPE_CLOUDFLARED),
         "frpRunning" to TunnelService.isTunnelRunning(TunnelService.TYPE_FRP),
         "withinWindow" to isWithinTimeWindow(),
+        "cameraActive" to cameraBound,
+        "ondemand" to ondemandCamera,
+        "reserveMb" to reserveMbCfg,
+        "storage" to storageInfo(),
         "resolutions" to supportedResolutions(),
     )
 
@@ -1243,6 +1315,7 @@ class CameraService : LifecycleService(), StreamControl {
                 item["size"] = f.length()
                 item["modified"] = f.lastModified()
                 item["durationMs"] = probeDurationMs(f)
+                item["starred"] = isStarred(rel)
                 out.add(item)
             }
         } catch (e: Exception) {
@@ -1318,6 +1391,211 @@ class CameraService : LifecycleService(), StreamControl {
         if (src.width <= maxW) return src
         val h = (src.height.toLong() * maxW / src.width).toInt().coerceAtLeast(1)
         return Bitmap.createScaledBitmap(src, maxW, h, true)
+    }
+
+    // ─── 精选 / 删除 / 存储配额 ────────────────────────────────
+
+    private fun starFile(): File = File(recordDir, ".starred")
+
+    private fun loadStars(): MutableSet<String> {
+        starSet?.let { return it }
+        synchronized(starLock) {
+            starSet?.let { return it }
+            val set = HashSet<String>()
+            try {
+                val f = starFile()
+                if (f.isFile) f.readLines().forEach { line ->
+                    val t = line.trim()
+                    if (t.isNotEmpty()) set.add(t)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "读取精选列表失败", e)
+            }
+            starSet = set
+            return set
+        }
+    }
+
+    /** 原子保存精选列表（先写临时文件再改名，降低断电损坏风险） */
+    private fun persistStars() {
+        try {
+            val set = starSet ?: return
+            val text = set.joinToString("\n")
+            val tmp = File(recordDir, ".starred.tmp")
+            tmp.writeText(text)
+            val dst = starFile()
+            if (!tmp.renameTo(dst)) {
+                dst.writeText(text)
+                tmp.delete()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "保存精选列表失败", e)
+        }
+    }
+
+    private fun isStarred(relPath: String): Boolean =
+        synchronized(starLock) { loadStars().contains(relPath) }
+
+    override fun setStarred(relPath: String, starred: Boolean): Boolean {
+        if (recordingFile(relPath) == null) return false
+        synchronized(starLock) {
+            val set = loadStars()
+            if (starred) set.add(relPath) else set.remove(relPath)
+            persistStars()
+        }
+        return true
+    }
+
+    override fun deleteRecording(relPath: String, force: Boolean): Boolean {
+        val f = recordingFile(relPath) ?: return false
+        if (!force && isStarred(relPath)) return false
+        val ok = try { f.delete() } catch (e: Exception) { false }
+        if (ok) {
+            synchronized(thumbLock) { thumbCache.keys.removeAll { it.startsWith(relPath + ":") } }
+            synchronized(starLock) {
+                if (loadStars().remove(relPath)) persistStars()
+            }
+        }
+        return ok
+    }
+
+    /** 缓存录像总字节数（最多每 15s 重扫一次，避免频繁遍历目录） */
+    private fun recordingBytes(): Long {
+        val now = System.currentTimeMillis()
+        if (now - cachedRecBytesAt < 15_000L) return cachedRecBytes
+        var sum = 0L
+        try {
+            recordDir.walkTopDown()
+                .filter { it.isFile && it.extension.equals("mp4", ignoreCase = true) }
+                .forEach { sum += it.length() }
+        } catch (_: Exception) {
+        }
+        cachedRecBytes = sum
+        cachedRecBytesAt = now
+        return sum
+    }
+
+    private fun storageInfo(): Map<String, Any?> {
+        var total = 0L
+        var free = 0L
+        try {
+            val ext = getExternalFilesDir(null)
+            if (ext != null) {
+                val s = StatFs(ext.absolutePath)
+                total = s.totalBytes
+                free = s.availableBytes
+            }
+        } catch (_: Exception) {
+        }
+        return linkedMapOf(
+            "totalBytes" to total,
+            "freeBytes" to free,
+            "recordingBytes" to recordingBytes(),
+            "reserveMb" to reserveMbCfg,
+            "starredCount" to synchronized(starLock) { loadStars().size },
+            "lastAutoDeleted" to lastAutoDeleted,
+        )
+    }
+
+    /**
+     * 存储配额：预留可用空间模式下，可用空间低于预留值时按最早修改时间删除「未精选」录像。
+     * reserveMb<=0 时不做任何清理。返回本次释放的字节数。
+     */
+    private fun enforceStorageQuota(): Long {
+        val reserveMb = reserveMbCfg
+        if (reserveMb <= 0) return 0L
+        val now = System.currentTimeMillis()
+        if (now - lastCleanAt < 5000L) return 0L
+        lastCleanAt = now
+        var freed = 0L
+        try {
+            val reserveBytes = reserveMb.toLong() * 1024L * 1024L
+            val ext = getExternalFilesDir(null) ?: return 0L
+            val free = try { StatFs(ext.absolutePath).availableBytes } catch (e: Exception) { return 0L }
+            if (free >= reserveBytes) return 0L
+
+            val all = ArrayList<File>()
+            recordDir.listFiles()?.forEach { day ->
+                if (day.isDirectory) day.listFiles()?.forEach { f ->
+                    if (f.isFile && f.name.endsWith(".mp4", ignoreCase = true)) all.add(f)
+                }
+            }
+            all.sortBy { it.lastModified() }
+            val base = recordDir.toURI()
+            var deleted = 0
+            for (f in all) {
+                if (free + freed >= reserveBytes) break
+                val rel = base.relativize(f.toURI()).path
+                if (isStarred(rel)) continue
+                val len = f.length()
+                if (try { f.delete() } catch (e: Exception) { false }) {
+                    freed += len
+                    deleted++
+                    synchronized(thumbLock) { thumbCache.keys.removeAll { it.startsWith(rel + ":") } }
+                }
+            }
+            if (deleted > 0) {
+                lastAutoDeleted = deleted
+                cachedRecBytesAt = 0L  // 失效缓存
+                Log.d(TAG, "存储配额清理：删除 $deleted 个未精选录像，释放 ${freed / 1048576}MB")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "存储配额清理失败", e)
+        }
+        return freed
+    }
+
+    // ─── 按需摄像头（省电） ──────────────────────────────────
+
+    override fun wakeCamera(ttlSec: Int): Boolean {
+        val ttl = ttlSec.coerceIn(5, 24 * 3600)
+        cameraDemandUntilMs = System.currentTimeMillis() + ttl * 1000L
+        lastDemandMs = System.currentTimeMillis()
+        handler.post { if (isRunning && !cameraBound && !cameraStarting) startCamera() }
+        return true
+    }
+
+    /** 是否有外部拉流需求（MJPEG 客户端 / HLS 近端） */
+    private fun hasStreamDemand(): Boolean {
+        if (mjpegStreamer.getClientCount() > 0) return true
+        if (hlsManager.hasRecentClient()) return true
+        return System.currentTimeMillis() - mjpegStreamer.lastSnapshotRequestMs < 5000L
+    }
+
+    /** 是否有录像任务在占用相机 */
+    private fun recordingActive(): Boolean = isRecording || continuousRecording || manualRecording
+
+    /**
+     * 评估相机需求（周期调用）：按需模式下无需求时释放相机，有需求时重新绑定。
+     * 录像模式需要相机（连续/运动）时始终视为有需求，不与现有设置冲突。
+     */
+    private fun evaluateCameraDemand() {
+        if (!isRunning) return
+        val now = System.currentTimeMillis()
+        // 安全兜底：绑定回调长时间未返回时复位标志，避免永久卡住无法再开相机
+        if (cameraStarting && now - cameraStartAt > 15_000L) cameraStarting = false
+        if (!ondemandCamera) {
+            if (!cameraBound && !cameraStarting) startCamera()
+            return
+        }
+        val modeNeedsCamera = recordMode != MODE_PREVIEW_ONLY
+        val apiWake = now < cameraDemandUntilMs
+        val demand = modeNeedsCamera || recordingActive() || apiWake || hasStreamDemand()
+        if (demand) {
+            lastDemandMs = now
+            if (!cameraBound && !cameraStarting) startCamera()
+        } else if (cameraBound && now - lastDemandMs > 20_000L) {
+            releaseCameraIdle()
+        }
+    }
+
+    private fun releaseCameraIdle() {
+        if (recordingActive()) return
+        try { cameraProvider?.unbindAll() } catch (_: Exception) {}
+        cameraBound = false
+        cameraStarting = false
+        stopH264Encoder()
+        Log.d(TAG, "无客户端且无录像任务，按需关闭摄像头以省电")
     }
 
     /**

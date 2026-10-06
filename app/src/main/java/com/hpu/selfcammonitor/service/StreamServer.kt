@@ -91,6 +91,9 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
             uri == "/api/config" -> serveConfig(s)
             uri == "/api/record" -> serveRecord(s)
             uri == "/api/recordings" -> serveRecordings()
+            uri == "/api/star" -> serveStar(s)
+            uri == "/api/delete" -> serveDelete(s)
+            uri == "/api/camera" -> serveCamera(s)
             uri == "/api/snapshot" -> serveSnapshot(download = true)
             uri.startsWith("/thumb/") -> serveThumb(uri)
             uri.startsWith("/dl/") -> serveRecordingFile(s, uri, download = true)
@@ -252,6 +255,54 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
         }
     }
 
+    /** 设置/取消「精选」（精选不会被自动清理） */
+    private fun serveStar(session: IHTTPSession): Response {
+        val ctrl = control
+            ?: return jsonResponse("{\"error\":\"\u670d\u52a1\u672a\u5c31\u7eea\"}")
+        return try {
+            val p = readParams(session)
+            val rel = p["path"] ?: p["file"] ?: p["rel"] ?: ""
+            val raw = p["on"]
+            val on = !(raw == "0" || raw.equals("false", true) || raw.equals("no", true))
+            val ok = rel.isNotBlank() && ctrl.setStarred(rel, on)
+            jsonResponse("{\"ok\":$ok,\"path\":\"${jsonEscape(rel)}\",\"starred\":$on}")
+        } catch (e: Exception) {
+            jsonResponse("{\"error\":\"${jsonEscape(e.message ?: "star error")}\"}")
+        }
+    }
+
+    /** 删除录像（force=1 时可删除精选） */
+    private fun serveDelete(session: IHTTPSession): Response {
+        val ctrl = control
+            ?: return jsonResponse("{\"error\":\"\u670d\u52a1\u672a\u5c31\u7eea\"}")
+        return try {
+            val p = readParams(session)
+            val rel = p["path"] ?: p["file"] ?: p["rel"] ?: ""
+            if (rel.isBlank()) return jsonResponse("{\"ok\":false,\"error\":\"\u7f3a\u5c11 path\"}")
+            val force = p["force"] == "1" || p["force"].equals("true", true)
+            val ok = ctrl.deleteRecording(rel, force)
+            jsonResponse("{\"ok\":$ok,\"path\":\"${jsonEscape(rel)}\"}")
+        } catch (e: Exception) {
+            jsonResponse("{\"error\":\"${jsonEscape(e.message ?: "delete error")}\"}")
+        }
+    }
+
+    /** 手动唤醒摄像头（按需省电模式下用） */
+    private fun serveCamera(session: IHTTPSession): Response {
+        val ctrl = control
+            ?: return jsonResponse("{\"error\":\"\u670d\u52a1\u672a\u5c31\u7eea\"}")
+        return try {
+            val p = readParams(session)
+            val ttl = p["ttl"]?.toIntOrNull() ?: 60
+            val on = !(p["on"] == "0" || p["on"].equals("false", true))
+            val ok = if (on) ctrl.wakeCamera(ttl) else false
+            val active = ctrl.state()["cameraActive"] ?: false
+            jsonResponse("{\"ok\":$ok,\"cameraActive\":$active,\"ttl\":$ttl}")
+        } catch (e: Exception) {
+            jsonResponse("{\"error\":\"${jsonEscape(e.message ?: "camera error")}\"}")
+        }
+    }
+
     /** 录像缩略图 */
     private fun serveThumb(uri: String): Response {
         val ctrl = control
@@ -359,6 +410,9 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
             "{\"path\":\"/api/record?action=start&duration=N\",\"desc\":\"开始录制，N 秒后自动停止（duration=0 表示不限时）\"}," +
             "{\"path\":\"/api/record?action=stop\",\"desc\":\"停止录制\"}," +
             "{\"path\":\"/api/recordings\",\"desc\":\"录像列表 JSON\"}," +
+            "{\"path\":\"/api/star?path=<rel>&on=1\",\"desc\":\"设置/取消精选（精选不会被自动清理）\"}," +
+            "{\"path\":\"/api/delete?path=<rel>[&force=1]\",\"desc\":\"删除录像；精选需 force=1\"}," +
+            "{\"path\":\"/api/camera?on=1&ttl=60\",\"desc\":\"唤醒摄像头（按需省电模式）\"}," +
             "{\"path\":\"/dl/<date>/<file>.mp4\",\"desc\":\"下载（支持 Range 断点/分片）\"}," +
             "{\"path\":\"/play/<date>/<file>.mp4\",\"desc\":\"网页内联播放（支持 Range）\"}," +
             "{\"path\":\"/thumb/<date>/<file>.mp4\",\"desc\":\"缩略图 jpg\"}," +
@@ -436,7 +490,7 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
         }
     }
 
-    /** 极简 JSON 序列化：支持 Map<String,Any?>，值类型为 String/Number/Boolean/List<*> */
+    /** 极简 JSON 序列化：支持 Map<String,Any?>，值类型为 String/Number/Boolean/List/Map */
     private fun toJson(map: Map<String, Any?>): String = buildString {
         append("{")
         var first = true
@@ -444,18 +498,21 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
             if (!first) append(",")
             first = false
             append("\"").append(jsonEscape(k)).append("\":")
-            when (v) {
-                null -> append("null")
-                is Number, is Boolean -> append(v.toString())
-                is List<*> -> {
-                    append("[")
-                    append(v.joinToString(",") { "\"" + jsonEscape(it.toString()) + "\"" })
-                    append("]")
-                }
-                else -> append("\"").append(jsonEscape(v.toString())).append("\"")
-            }
+            append(jsonValue(v))
         }
         append("}")
+    }
+
+    private fun jsonValue(v: Any?): String = when (v) {
+        null -> "null"
+        is Number, is Boolean -> v.toString()
+        is Map<*, *> -> {
+            val m = LinkedHashMap<String, Any?>()
+            v.forEach { (k, vv) -> m[k.toString()] = vv }
+            toJson(m)
+        }
+        is List<*> -> "[" + v.joinToString(",") { jsonValue(it) } + "]"
+        else -> "\"" + jsonEscape(v.toString()) + "\""
     }
 
     companion object {
@@ -485,6 +542,7 @@ header{display:flex;align-items:center;gap:10px;padding:10px 14px;background:lin
 .badge{font-size:11px;color:var(--mut);background:var(--card2);border:1px solid var(--line);border-radius:999px;padding:3px 9px;white-space:nowrap}
 .badge.rec{color:#fff;background:var(--err);border-color:var(--err);animation:pulse 1.2s infinite}
 .badge.proto{color:#93c5fd;border-color:#3b82f6}
+.badge.warn{color:#fbbf24;border-color:#b45309}
 main{flex:1;display:flex;flex-direction:column;min-height:0}
 #stage{position:relative;flex:1;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000;touch-action:none}
 #img{display:block;max-width:100%;max-height:100%;object-fit:contain;-webkit-user-drag:none;user-select:none;transform-origin:center center;will-change:transform}
@@ -492,14 +550,16 @@ main{flex:1;display:flex;flex-direction:column;min-height:0}
 #overlay{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:#7c8798;font-size:15px;display:none;z-index:5}
 #overlay.show{display:block}
 .vtoolbar{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);display:flex;gap:8px;z-index:6}
-.iconbtn{width:44px;height:44px;border-radius:50%;border:1px solid rgba(255,255,255,.18);background:rgba(20,25,32,.72);color:#e6ebf2;font-size:17px;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px);touch-action:manipulation;text-decoration:none}
-.iconbtn:active{background:rgba(59,130,246,.85)}
+.iconbtn{width:44px;height:44px;border-radius:50%;border:1px solid rgba(255,255,255,.18);background:rgba(20,25,32,.72);color:#e6ebf2;font-size:17px;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px);touch-action:manipulation;text-decoration:none;transition:transform .16s ease,background .16s ease,border-color .16s ease,box-shadow .16s ease}
+.iconbtn:hover{background:rgba(59,130,246,.9);border-color:var(--acc);transform:translateY(-3px) scale(1.05);box-shadow:0 8px 20px rgba(59,130,246,.4)}
+.iconbtn:active{transform:translateY(0) scale(.96);background:rgba(59,130,246,.85)}
 .iconbtn.rec.on{background:var(--err);border-color:var(--err)}
 .iconbtn.on{background:var(--acc);border-color:var(--acc)}
 .vtoolbar.up{bottom:70px}
 #dvr{position:absolute;left:12px;right:12px;bottom:12px;display:none;align-items:center;gap:10px;background:rgba(20,25,32,.74);border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:8px 12px;z-index:7;backdrop-filter:blur(6px)}
 #dvr.show{display:flex}
-.dvr-live{flex-shrink:0;font-size:11px;font-weight:700;color:var(--mut);background:var(--card2);border:1px solid var(--line);border-radius:999px;padding:5px 11px;cursor:pointer;letter-spacing:.5px}
+.dvr-live{flex-shrink:0;font-size:11px;font-weight:700;color:var(--mut);background:var(--card2);border:1px solid var(--line);border-radius:999px;padding:5px 11px;cursor:pointer;letter-spacing:.5px;transition:background .16s ease,color .16s ease,border-color .16s ease,box-shadow .16s ease}
+.dvr-live:hover{border-color:var(--acc);color:var(--fg);box-shadow:0 0 0 3px rgba(59,130,246,.18)}
 .dvr-live.on{color:#fff;background:var(--err);border-color:var(--err)}
 .dvr-live.off{color:#111;background:var(--warn);border-color:var(--warn)}
 #dvr-seek{flex:1;min-width:0;background:transparent;border:none;height:26px;cursor:pointer}
@@ -507,7 +567,9 @@ main{flex:1;display:flex;flex-direction:column;min-height:0}
 #panel{flex-shrink:0;background:var(--card);border-top:1px solid var(--line);padding:12px 14px;display:flex;flex-direction:column;gap:12px;max-height:46vh;overflow-y:auto}
 .prow{display:flex;align-items:center;gap:10px}
 .prow label.k{width:64px;flex-shrink:0;font-size:13px;color:var(--mut)}
-select,input[type=range]{flex:1;min-width:0;background:var(--card2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:14px;outline:none}
+select,input[type=range]{flex:1;min-width:0;background:var(--card2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:14px;outline:none;transition:border-color .16s ease,box-shadow .16s ease,background .16s ease}
+select:hover,input[type=range]:hover{border-color:var(--acc);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
+select:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(59,130,246,.22)}
 input[type=range]{padding:0;height:28px;background:transparent;border:none}
 .val{min-width:56px;text-align:right;font-size:13px;color:var(--mut);flex-shrink:0}
 .switch{position:relative;width:46px;height:26px;flex-shrink:0}
@@ -517,6 +579,11 @@ input[type=range]{padding:0;height:28px;background:transparent;border:none}
 .switch input:checked+span{background:var(--acc);border-color:var(--acc)}
 .switch input:checked+span:before{transform:translateX(20px);background:#fff}
 .pinfo{font-size:12px;color:var(--mut);line-height:1.6}
+.minibtn{flex-shrink:0;font-size:12px;color:#fff;background:var(--acc);border:1px solid var(--acc);border-radius:8px;padding:6px 12px;cursor:pointer;transition:transform .16s ease,background .16s ease,box-shadow .16s ease,filter .16s ease}
+.minibtn:hover{background:var(--primary_dark,#1d4ed8);transform:translateY(-2px);box-shadow:0 6px 16px rgba(59,130,246,.4)}
+.minibtn:active{transform:translateY(0) scale(.97);filter:brightness(.95)}
+.minibtn.warn{background:var(--warn);border-color:var(--warn);color:#111}
+.minibtn.warn:hover{background:#d97706;box-shadow:0 6px 16px rgba(245,158,11,.4)}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);background:rgba(20,25,32,.95);color:#fff;border:1px solid var(--line);padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:.25s;z-index:50;max-width:80vw;text-align:center}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 @media(min-width:900px){
@@ -539,6 +606,8 @@ main{flex-direction:row}
 <span class="badge" id="b-net">-- MB/s</span>
 <span class="badge" id="b-buf">--</span>
 <span class="badge" id="b-res">--</span>
+<span class="badge" id="b-cam">摄像头 --</span>
+<span class="badge" id="b-store">存储 --</span>
 <span class="badge rec" id="b-rec" style="display:none">录制中</span>
 </div>
 </header>
@@ -563,6 +632,7 @@ main{flex-direction:row}
 <div class="prow"><label class="k">帧率</label><input id="rng-fps" type="range" min="1" max="60" step="1" value="16"><span class="val" id="lbl-fps">16 fps</span></div>
 <div class="prow"><label class="k">摄像头</label><select id="sel-face"><option value="0">后置</option><option value="1">前置</option></select></div>
 <div class="prow"><label class="k">录像模式</label><select id="sel-mode"><option value="2">仅预览</option><option value="0">连续录像</option><option value="1">运动触发</option></select></div>
+<div class="prow"><label class="k">摄像头</label><span class="badge" id="b-cam2" style="flex:1;text-align:center">--</span><button class="minibtn" id="btn-wake">唤醒</button></div>
 <div class="prow"><label class="k">MJPEG</label><label class="switch"><input id="sw-mjpeg" type="checkbox"><span></span></label><span class="val" id="lbl-mjpeg">开启</span></div>
 <div class="pinfo" id="pinfo"></div>
 </aside>
@@ -578,6 +648,8 @@ swMjpeg=document.getElementById('sw-mjpeg'),lblMjpeg=document.getElementById('lb
 selMode=document.getElementById('sel-mode'),btnRec=document.getElementById('btn-rec'),
 bFps=document.getElementById('b-fps'),bNet=document.getElementById('b-net'),bBuf=document.getElementById('b-buf'),
 bRes=document.getElementById('b-res'),bRec=document.getElementById('b-rec'),bProto=document.getElementById('b-proto'),
+bCam=document.getElementById('b-cam'),bCam2=document.getElementById('b-cam2'),bStore=document.getElementById('b-store'),
+btnWake=document.getElementById('btn-wake'),
 pinfo=document.getElementById('pinfo'),toastEl=document.getElementById('toast');
 var dvrEl=document.getElementById('dvr'),dvSeek=document.getElementById('dvr-seek'),
 dvLive=document.getElementById('dvr-live'),dvTime=document.getElementById('dvr-time'),
@@ -648,12 +720,26 @@ function toggleFs(){
 }
 function api(path){return fetch(path,{cache:'no-store'}).then(function(r){return r.json();});}
 function fmtRate(bps){return (bps/1048576).toFixed(2)+' MB/s';}
+function fmtSize(n){n=Number(n)||0;if(!n)return '0 B';var u=['B','KB','MB','GB','TB'];var i=0;while(n>=1024&&i<u.length-1){n/=1024;i++;}return (i?n.toFixed(1):n)+' '+u[i];}
 function refresh(d){
   if(!d||d.error)return;
   lastState=d;
   bFps.textContent=(d.currentFps||0)+' fps';
   if(typeof d.netRateBps==='number')bNet.textContent=fmtRate(d.netRateBps);
   bRes.textContent=d.resolution||'--';
+  if(typeof d.cameraActive==='boolean'){
+    var camTxt=d.cameraActive?'已开启':'休眠';
+    bCam.textContent='摄像头 '+camTxt;
+    bCam.className='badge'+(d.cameraActive?'':' warn');
+    if(bCam2){bCam2.textContent=camTxt+(d.ondemand?'（按需）':'');bCam2.className='badge'+(d.cameraActive?'':' warn');}
+    if(btnWake){btnWake.style.display=(d.ondemand&&!d.cameraActive)?'':'none';}
+  }
+  if(d.storage&&typeof d.storage==='object'){
+    var st=d.storage;var free=Number(st.freeBytes)||0;
+    var s='可用 '+fmtSize(free);
+    if(Number(st.reserveMb)>0)s+=' / 预留 '+st.reserveMb+'M';
+    bStore.textContent='存储 '+s;
+  }
   if(!resFilled&&d.resolutions&&d.resolutions.length){
     resFilled=true;
     d.resolutions.forEach(function(r){var o=document.createElement('option');o.value=r;o.textContent=r;selRes.appendChild(o);});
@@ -826,6 +912,13 @@ function toggleSound(){
   if(soundOn&&lastState&&lastState.audio===false)toast('该路流无音频（麦克风未授权）');
 }
 btnSnd.addEventListener('click',toggleSound);
+if(btnWake){btnWake.addEventListener('click',function(){
+  btnWake.classList.add('warn');btnWake.textContent='唤醒中...';
+  api('/api/camera?on=1&ttl=120').then(function(d){
+    toast('已唤醒摄像头');
+    setTimeout(heartbeat,600);setTimeout(heartbeat,2500);
+  }).catch(function(){toast('唤醒失败');}).then(function(){btnWake.classList.remove('warn');btnWake.textContent='唤醒';});
+});}
 selBuf.addEventListener('change',applyBufferPreset);
 selRes.addEventListener('change',function(){applyConfig({resolution:selRes.value},'分辨率将重启相机生效');resFilled=false;});
 selFace.addEventListener('change',function(){resFilled=false;selRes.innerHTML='';applyConfig({facing:selFace.value},'已切换摄像头');});
@@ -882,6 +975,14 @@ header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:10px
 .meta{padding:8px 10px;display:flex;flex-direction:column;gap:3px}
 .meta .name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .meta .sub{font-size:11px;color:var(--mut);display:flex;justify-content:space-between;gap:6px}
+.ops{position:absolute;top:6px;right:6px;display:flex;gap:6px;z-index:3}
+.op{width:30px;height:30px;border-radius:8px;border:1px solid rgba(255,255,255,.25);background:rgba(20,25,32,.72);color:#e6ebf2;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;line-height:1;transition:transform .16s ease,background .16s ease,border-color .16s ease}
+.op:hover{transform:translateY(-2px) scale(1.08)}
+.op:active{background:var(--acc);border-color:var(--acc)}
+.op.star.on{background:var(--warn);border-color:var(--warn);color:#111}
+.op.del:hover{background:var(--err);border-color:var(--err);color:#fff}
+.card.starcard{border-color:var(--warn)}
+.card.starcard .thumb:after{content:"\2605";position:absolute;left:6px;top:4px;color:var(--warn);font-size:16px;text-shadow:0 1px 3px #000}
 .empty{padding:60px 20px;text-align:center;color:var(--mut);line-height:1.9}
 .empty .big{font-size:44px;margin-bottom:8px}
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.82);display:none;align-items:center;justify-content:center;z-index:100;padding:16px}
@@ -912,6 +1013,7 @@ header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:10px
 <div class="bar">
 <span id="stat">加载中...</span>
 <span class="sp"></span>
+<span id="storage"></span>
 <span>分片大小</span>
 <select id="sel-chunk">
 <option value="1048576">1 MB</option>
@@ -930,6 +1032,8 @@ header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:10px
 <button class="btn" id="m-chunk">&#9986; 分片下载</button>
 <span class="sp"></span>
 <button class="btn" id="m-open">&#128065; 新窗口</button>
+<button class="btn" id="m-star">&#9734; 精选</button>
+<button class="btn" id="m-del">&#128465; 删除</button>
 </div>
 <div class="ft ft2">
 <span class="lb">下载链路</span>
@@ -948,7 +1052,8 @@ var grid=document.getElementById('grid'),statEl=document.getElementById('stat'),
 var modal=document.getElementById('modal'),mVideo=document.getElementById('m-video'),mTitle=document.getElementById('m-title');
 var progwrap=document.getElementById('m-progwrap'),progbar=document.getElementById('m-progbar'),progtxt=document.getElementById('m-progtxt');
 var selChunk=document.getElementById('sel-chunk');
-var files=[],curRel='',selLink=document.getElementById('sel-link'),linkMode='auto',tunnels={cf:'',frp:'',lan:''},linkLoaded=false;
+var files=[],curRel='',curIndex=-1,selLink=document.getElementById('sel-link'),linkMode='auto',tunnels={cf:'',frp:'',lan:''},linkLoaded=false;
+var storageEl=document.getElementById('storage'),mStar=document.getElementById('m-star'),mDel=document.getElementById('m-del');
 function toast(m){toastEl.textContent=m;toastEl.classList.add('show');clearTimeout(toastEl._t);toastEl._t=setTimeout(function(){toastEl.classList.remove('show');},2200);}
 function fmtSize(n){n=Number(n)||0;if(!n)return '0 B';var u=['B','KB','MB','GB'];var i=0;while(n>=1024&&i<u.length-1){n/=1024;i++;}return (i?n.toFixed(1):n)+' '+u[i];}
 function fmtDur(ms){ms=Number(ms)||0;if(ms<=0)return '--:--';var s=Math.round(ms/1000);var m=Math.floor(s/60);s=s%60;return (m<10?'0':'')+m+':'+(s<10?'0':'')+s;}
@@ -969,6 +1074,10 @@ function loadLinks(){
     if(tunnels.frp)h+='<option value="frp">frp 隧道</option>';
     if(tunnels.lan)h+='<option value="lan">局域网直连</option>';
     selLink.innerHTML=h;linkMode='auto';linkLoaded=true;
+    if(storageEl&&d.storage&&typeof d.storage==='object'){
+      var st=d.storage;
+      storageEl.textContent='\u53ef\u7528 '+fmtSize(Number(st.freeBytes)||0)+' / \u5171 '+fmtSize(Number(st.totalBytes)||0)+(Number(st.reserveMb)>0?('  \u00b7  \u9884\u7559 '+st.reserveMb+'M'):'');
+    }
   }).catch(function(){linkLoaded=true;});
 }
 function load(){
@@ -987,21 +1096,45 @@ function render(){
   var html='';
   for(var i=0;i<files.length;i++){
     var f=files[i];
-    html+='<div class="card" data-i="'+i+'">';
-    html+='<div class="thumb"><img loading="lazy" src="/thumb/'+encodeURI(f.relPath)+'" alt=""><span class="dur">'+fmtDur(f.durationMs)+'</span></div>';
-    html+='<div class="meta"><div class="name">'+esc(f.name)+'</div><div class="sub"><span>'+esc(f.date)+'</span><span>'+fmtTime(f.modified)+'</span></div><div class="sub"><span>'+fmtSize(f.size)+'</span></div></div>';
+    html+='<div class="card'+(f.starred?' starcard':'')+'" data-i="'+i+'">';
+    html+='<div class="thumb"><img loading="lazy" src="/thumb/'+encodeURI(f.relPath)+'" alt=""><span class="dur">'+fmtDur(f.durationMs)+'</span>';
+    html+='<div class="ops"><button class="op star'+(f.starred?' on':'')+'" data-op="star" data-i="'+i+'" title="精选">'+(f.starred?'\u2605':'\u2606')+'</button>';
+    html+='<button class="op del" data-op="del" data-i="'+i+'" title="删除">\uD83D\uDDD1</button></div></div>';
+    html+='<div class="meta"><div class="name">'+esc(f.name)+'</div><div class="sub"><span>'+esc(f.date)+'</span><span>'+fmtTime(f.modified)+'</span></div><div class="sub"><span>'+fmtSize(f.size)+'</span>'+(f.starred?'<span style="color:var(--warn)">\u5df2\u7cbe\u9009</span>':'')+'</div></div>';
     html+='</div>';
   }
   grid.innerHTML=html;
   var cards=grid.querySelectorAll('.card');
   for(var j=0;j<cards.length;j++){cards[j].addEventListener('click',function(){openPlayer(parseInt(this.getAttribute('data-i'),10));});}
+  var ops=grid.querySelectorAll('.op');
+  for(var m=0;m<ops.length;m++){ops[m].addEventListener('click',function(ev){ev.stopPropagation();var i=parseInt(this.getAttribute('data-i'),10);var op=this.getAttribute('data-op');if(op==='star')toggleStar(i);else delItem(i);});}
   var imgs=grid.querySelectorAll('.thumb img');
   for(var k=0;k<imgs.length;k++){imgs[k].addEventListener('error',function(){this.style.visibility='hidden';});}
 }
+function setStarBtn(f){if(!mStar)return;mStar.innerHTML=f.starred?'\u2605 \u53d6\u6d88\u7cbe\u9009':'\u2606 \u7cbe\u9009';}
+function toggleStar(i){
+  var f=files[i];if(!f)return;
+  var want=!f.starred;
+  fetch('/api/star?path='+encodeURIComponent(f.relPath)+'&on='+(want?'1':'0'),{cache:'no-store'})
+    .then(function(r){return r.json();})
+    .then(function(d){if(d&&d.ok){f.starred=want;render();if(curIndex===i)setStarBtn(f);toast(want?'\u5df2\u52a0\u5165\u7cbe\u9009\uff08\u4e0d\u4f1a\u88ab\u81ea\u52a8\u6e05\u7406\uff09':'\u5df2\u53d6\u6d88\u7cbe\u9009');}else{toast('\u64cd\u4f5c\u5931\u8d25');}})
+    .catch(function(){toast('\u64cd\u4f5c\u5931\u8d25');});
+}
+function delItem(i){
+  var f=files[i];if(!f)return;
+  var msg=f.starred?('\u300c'+f.name+'\u300d\u5df2\u7cbe\u9009\uff0c\u5220\u9664\u540e\u4e0d\u53ef\u6062\u590d\uff0c\u786e\u5b9a\u5220\u9664\uff1f'):('\u786e\u5b9a\u5220\u9664\u300c'+f.name+'\u300d\uff1f\u6b64\u64cd\u4f5c\u4e0d\u53ef\u6062\u590d');
+  if(!confirm(msg))return;
+  var q='/api/delete?path='+encodeURIComponent(f.relPath)+(f.starred?'&force=1':'');
+  fetch(q,{cache:'no-store'})
+    .then(function(r){return r.json();})
+    .then(function(d){if(d&&d.ok){toast('\u5df2\u5220\u9664');if(curRel===f.relPath)closePlayer();load();}else{toast('\u5220\u9664\u5931\u8d25');}})
+    .catch(function(){toast('\u5220\u9664\u5931\u8d25');});
+}
 function openPlayer(i){
   var f=files[i];if(!f)return;
-  curRel=f.relPath;
+  curRel=f.relPath;curIndex=i;
   mTitle.textContent=f.name+'  ·  '+fmtSize(f.size)+'  ·  '+fmtDur(f.durationMs);
+  setStarBtn(f);
   mVideo.src=playUrl(f.relPath);
   progwrap.style.display='none';progbar.style.width='0';progtxt.textContent='0%';
   modal.classList.add('show');
@@ -1056,6 +1189,8 @@ document.getElementById('m-chunk').addEventListener('click',doChunkDownload);
 document.getElementById('m-copy').addEventListener('click',copyDirect);
 document.getElementById('m-open').addEventListener('click',function(){if(curRel)window.open(playUrl(curRel),'_blank');});
 selLink.addEventListener('change',function(){linkMode=selLink.value;});
+if(mStar)mStar.addEventListener('click',function(){if(curIndex>=0)toggleStar(curIndex);});
+if(mDel)mDel.addEventListener('click',function(){if(curIndex>=0)delItem(curIndex);});
 load();
 setInterval(load,15000);
 </script>

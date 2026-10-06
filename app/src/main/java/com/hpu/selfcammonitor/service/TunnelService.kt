@@ -10,7 +10,9 @@ import android.content.SharedPreferences
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -52,6 +54,18 @@ class TunnelService : Service() {
 
     private val channelId = "tunnel_service_channel"
     private val notificationId = 2
+
+    // 自动重启：进程意外退出后按指数退避重连
+    private val restartHandler = Handler(Looper.getMainLooper())
+    @Volatile private var cfAutoRestart = true
+    @Volatile private var frpAutoRestart = true
+    @Volatile private var cfRestartPending = false
+    @Volatile private var frpRestartPending = false
+    private var cfRestartAttempt = 0
+    private var frpRestartAttempt = 0
+    private var cfRestartRunnable: Runnable? = null
+    private var frpRestartRunnable: Runnable? = null
+    private val maxRestartAttempt = 24
 
     companion object {
         const val TAG = "TunnelService"
@@ -204,6 +218,7 @@ class TunnelService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         // 只清理进程，不再广播（避免覆盖失败/停止原因）
+        restartHandler.removeCallbacksAndMessages(null)
         killAll()
         stopDnsForwarder()
         instance = null
@@ -248,23 +263,68 @@ class TunnelService : Service() {
             startCloudflared(prefs.getString("cloudflared_token", "") ?: "")
         }
         if (frpEnabled(prefs) && !frpRunning) {
-            startFrpc(
-                server = prefs.getString("frp_server", "") ?: "",
-                serverPort = prefs.getString("frp_server_port", "7000")?.toIntOrNull() ?: 7000,
-                token = prefs.getString("frp_token", "") ?: "",
-                localIp = prefs.getString("frp_local_ip", "127.0.0.1") ?: "127.0.0.1",
-                localPort = prefs.getString("frp_local_port", "8080")?.toIntOrNull() ?: 8080,
-                subdomain = prefs.getString("frp_subdomain", "") ?: "",
-                domain = prefs.getString("frp_domain", "") ?: "",
-                protocol = prefs.getString("frp_protocol", "http") ?: "http",
-                remotePort = prefs.getString("frp_remote_port", "0")?.toIntOrNull() ?: 0,
-            )
+            startFrpFromPrefs(prefs)
         }
+    }
+
+    /** 从偏好读取 frp 参数并启动 */
+    private fun startFrpFromPrefs(prefs: SharedPreferences) {
+        startFrpc(
+            server = prefs.getString("frp_server", "") ?: "",
+            serverPort = prefs.getString("frp_server_port", "7000")?.toIntOrNull() ?: 7000,
+            token = prefs.getString("frp_token", "") ?: "",
+            localIp = prefs.getString("frp_local_ip", "127.0.0.1") ?: "127.0.0.1",
+            localPort = prefs.getString("frp_local_port", "8080")?.toIntOrNull() ?: 8080,
+            subdomain = prefs.getString("frp_subdomain", "") ?: "",
+            domain = prefs.getString("frp_domain", "") ?: "",
+            protocol = prefs.getString("frp_protocol", "http") ?: "http",
+            remotePort = prefs.getString("frp_remote_port", "0")?.toIntOrNull() ?: 0,
+        )
+    }
+
+    /**
+     * 进程意外退出后安排自动重启（指数退避，封顶 60s）。
+     * 用户手动停止（或未启用）时不重启。
+     */
+    private fun scheduleRestart(type: String) {
+        val prefs = getSharedPreferences("camera_prefs", MODE_PRIVATE)
+        val enabled = if (type == TYPE_CLOUDFLARED) cfEnabled(prefs) else frpEnabled(prefs)
+        val auto = if (type == TYPE_CLOUDFLARED) cfAutoRestart else frpAutoRestart
+        if (!enabled || !auto) return
+        // 配置根本为空时不重试（避免无意义刷屏）
+        if (type == TYPE_CLOUDFLARED && (prefs.getString("cloudflared_token", "") ?: "").isBlank()) return
+        if (type == TYPE_FRP && (prefs.getString("frp_server", "") ?: "").isBlank()) return
+
+        val attempt = if (type == TYPE_CLOUDFLARED) cfRestartAttempt else frpRestartAttempt
+        if (attempt >= maxRestartAttempt) {
+            broadcastStatus(type, "", false, "多次重连失败，已停止自动重试（可手动重新开启）")
+            return
+        }
+        val delay = (3000L shl minOf(attempt, 5)).coerceAtMost(60_000L)
+        if (type == TYPE_CLOUDFLARED) { cfRestartAttempt++; cfRestartPending = true } else { frpRestartAttempt++; frpRestartPending = true }
+
+        updateNotification(notificationText("连接断开，正在重连..."))
+        broadcastStatus(type, "", false, "连接断开，${delay / 1000}s 后自动重连（第 ${attempt + 1} 次）")
+        val task = Runnable {
+            if (type == TYPE_CLOUDFLARED) {
+                cfRestartPending = false
+                cfRestartRunnable = null
+                if (!cfRunning && cfAutoRestart) startCloudflared(prefs.getString("cloudflared_token", "") ?: "")
+            } else {
+                frpRestartPending = false
+                frpRestartRunnable = null
+                if (!frpRunning && frpAutoRestart) startFrpFromPrefs(prefs)
+            }
+            stopSelfIfIdle()
+        }
+        if (type == TYPE_CLOUDFLARED) cfRestartRunnable = task else frpRestartRunnable = task
+        restartHandler.postDelayed(task, delay)
     }
 
     // ─── cloudflared ───────────────────────────────────────────────
 
     private fun startCloudflared(token: String) {
+        cfAutoRestart = true
         if (token.isBlank()) {
             markFailed(TYPE_CLOUDFLARED, "Token 为空，请先在设置中配置")
             return
@@ -324,6 +384,7 @@ class TunnelService : Service() {
             readLogs(proc, "cloudflared") { line ->
                 if (!connected && line.contains("registered tunnel connection", ignoreCase = true)) {
                     connected = true
+                    cfRestartAttempt = 0
                     val domain = extractDomain(line)
                     cfUrl = when {
                         domain.startsWith("http") -> domain
@@ -359,6 +420,7 @@ class TunnelService : Service() {
         server: String, serverPort: Int, token: String, localIp: String, localPort: Int,
         subdomain: String, domain: String, protocol: String, remotePort: Int,
     ) {
+        frpAutoRestart = true
         if (server.isBlank()) {
             markFailed(TYPE_FRP, "frps 服务器地址为空")
             return
@@ -436,6 +498,7 @@ class TunnelService : Service() {
                 if (url != announced) {
                     announced = url
                     frpUrl = url
+                    frpRestartAttempt = 0
                     broadcastStatus(TYPE_FRP, url, true, "")
                     refreshNotification()
                 }
@@ -556,6 +619,7 @@ class TunnelService : Service() {
         }
         if (wasCurrent) {
             broadcastStatus(type, url, false, error.ifBlank { "连接已断开" })
+            scheduleRestart(type)
         }
         refreshNotification()
         stopSelfIfIdle()
@@ -564,9 +628,17 @@ class TunnelService : Service() {
     /** 停止单个类型（只杀对应进程） */
     private fun stopType(type: String) {
         if (type == TYPE_CLOUDFLARED) {
+            cfAutoRestart = false
+            cfRestartPending = false
+            cfRestartRunnable?.let { restartHandler.removeCallbacks(it) }
+            cfRestartRunnable = null
             killCloudflared()
             broadcastStatus(TYPE_CLOUDFLARED, "", false, "")
         } else if (type == TYPE_FRP) {
+            frpAutoRestart = false
+            frpRestartPending = false
+            frpRestartRunnable?.let { restartHandler.removeCallbacks(it) }
+            frpRestartRunnable = null
             killFrpc()
             broadcastStatus(TYPE_FRP, "", false, "")
         }
@@ -575,6 +647,11 @@ class TunnelService : Service() {
     }
 
     private fun stopAll() {
+        cfAutoRestart = false
+        frpAutoRestart = false
+        cfRestartPending = false
+        frpRestartPending = false
+        restartHandler.removeCallbacksAndMessages(null)
         killAll()
         stopDnsForwarder()
         // 主动停止不是错误：error 传空串，界面会显示“已停止”而非“错误: 已停止”
@@ -603,9 +680,9 @@ class TunnelService : Service() {
         killFrpc()
     }
 
-    /** 两者都不在运行则自行停止服务，避免通知常驻 */
+    /** 两者都不在运行且无待执行的重连时自行停止服务，避免通知常驻 */
     private fun stopSelfIfIdle() {
-        if (!anyRunning()) {
+        if (!anyRunning() && !cfRestartPending && !frpRestartPending) {
             try {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -621,6 +698,7 @@ class TunnelService : Service() {
             TYPE_FRP -> { frpRunning = false; frpUrl = "" }
         }
         broadcastStatus(type, "", false, msg)
+        scheduleRestart(type)
         refreshNotification()
         stopSelfIfIdle()
     }

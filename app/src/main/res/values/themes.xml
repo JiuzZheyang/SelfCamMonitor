@@ -32,8 +32,8 @@
 
     <!-- Custom CardView style -->
     <style name="Widget.SelfCamMonitor.CardView" parent="Widget.Material3.CardView.Elevated">
-        <item name="cardCornerRadius">12dp</item>
-        <item name="cardElevation">4dp</item>
+        <item name="cardCornerRadius">16dp</item>
+        <item name="cardElevation">3dp</item>
         <item name="strokeWidth">0dp</item>
     </style>
 
@@ -45,9 +45,10 @@
 
     <!-- Button styles -->
     <style name="Widget.SelfCamMonitor.Button" parent="Widget.Material3.Button">
-        <item name="cornerRadius">8dp</item>
+        <item name="cornerRadius">12dp</item>
         <item name="android:paddingVertical">12dp</item>
         <item name="android:textSize">16sp</item>
+        <item name="android:stateListAnimator">@animator/btn_lift</item>
     </style>
 
     <!-- Text styles -->

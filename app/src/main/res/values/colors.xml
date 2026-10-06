@@ -3,24 +3,24 @@
     <color name="white">#FFFFFFFF</color>
 
     <!-- App Theme Colors -->
-    <color name="primary">#2196F3</color>
-    <color name="primary_dark">#1976D2</color>
-    <color name="primary_light">#BBDEFB</color>
-    <color name="accent">#FF5722</color>
+    <color name="primary">#2563EB</color>
+    <color name="primary_dark">#1D4ED8</color>
+    <color name="primary_light">#DBEAFE</color>
+    <color name="accent">#F97316</color>
 
     <!-- Status Colors -->
-    <color name="status_stopped">#F44336</color>
-    <color name="green">#4CAF50</color>
+    <color name="status_stopped">#EF4444</color>
+    <color name="green">#22C55E</color>
 
     <!-- Background Colors -->
-    <color name="background_light">#FAFAFA</color>
+    <color name="background_light">#F4F6FB</color>
     <color name="surface">#FFFFFF</color>
 
     <!-- Text Colors -->
-    <color name="text_primary">#212121</color>
-    <color name="text_secondary">#757575</color>
-    <color name="text_hint">#BDBDBD</color>
+    <color name="text_primary">#111827</color>
+    <color name="text_secondary">#6B7280</color>
+    <color name="text_hint">#9CA3AF</color>
 
     <!-- Divider -->
-    <color name="divider">#E0E0E0</color>
+    <color name="divider">#E5E7EB</color>
 </resources>
