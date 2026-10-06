@@ -235,8 +235,13 @@ class MJPEGStreamer {
     // 替代原 containsValue 线性扫描（O(n) 且每 5ms 一次）
     private val removedClients = ConcurrentHashMap.newKeySet<ClientInfo>()
 
-    // 最新一帧 JPEG（供 /snapshot 端点使用）
+    // 最近一帧 JPEG（供 /snapshot 端点使用）
     private val latestJpeg = AtomicReference<ByteArray?>(null)
+
+    // 最近一次生产/请求 JPEG 的时间戳（供快照按需触发）
+    @Volatile private var lastJpegMs: Long = 0
+    @Volatile var lastSnapshotRequestMs: Long = 0
+        private set
 
     // 累计向 MJPEG 客户端写出的字节数（供网页显示实时网络速率）
     private val sentBytes = java.util.concurrent.atomic.AtomicLong(0)
@@ -269,6 +274,26 @@ class MJPEGStreamer {
 
     /** 获取最新一帧 JPEG 数据（供 /snapshot 端点） */
     fun getLatestJpeg(): ByteArray? = latestJpeg.get()
+
+    /** 请求一张新快照：置位后，上层会在短时间内继续生产 JPEG 帧 */
+    fun requestSnapshot() {
+        lastSnapshotRequestMs = System.currentTimeMillis()
+    }
+
+    /** 获取一张“尽量新鲜”的 JPEG：先标记请求，再等待至多 maxWaitMs 毫秒等新帧 */
+    fun getLatestJpegFresh(maxWaitMs: Long): ByteArray? {
+        requestSnapshot()
+        val start = System.currentTimeMillis()
+        var j = latestJpeg.get()
+        if (lastJpegMs < start) {
+            while (System.currentTimeMillis() - start < maxWaitMs) {
+                try { Thread.sleep(20) } catch (_: InterruptedException) { break }
+                j = latestJpeg.get()
+                if (lastJpegMs >= start) break
+            }
+        }
+        return j ?: latestJpeg.get()
+    }
 
     /** 累计已写出的字节数（采样差值可算网络速率） */
     fun getSentBytes(): Long = sentBytes.get()
@@ -333,6 +358,7 @@ class MJPEGStreamer {
         // 存储最新帧，供 /snapshot 端点使用（即使没有 MJPEG 客户端也存）
         latestJpeg.set(jpegData)
         lastFrameTime = System.currentTimeMillis()
+        lastJpegMs = lastFrameTime
 
         // 通知本地预览监听（原始 JPEG，无 multipart 头）；须在无网络客户端的提前返回之前
         if (frameListeners.isNotEmpty()) {
