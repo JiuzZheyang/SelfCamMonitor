@@ -130,6 +130,11 @@ class CameraService : LifecycleService(), StreamControl {
     @Volatile
     private var currentFps = 0
 
+    // 网络速率采样（MJPEG 出口字节/秒）
+    @Volatile private var netRateBps = 0L
+    private var netSampleBytes = 0L
+    private var netSampleTs = 0L
+
     // 只读诊断：区分「分析收到的原始帧」和「编码推送成功帧」
     private var diagRawCount = 0      // 分析线程收到的原始帧数（进如分析器起算，不含时间窗外）
     private var diagPushedCount = 0   // 实际编码并推送给客户端的帧数
@@ -809,6 +814,7 @@ class CameraService : LifecycleService(), StreamControl {
         "clientCount" to mjpegStreamer.getClientCount(),
         "lastFrameAge" to mjpegStreamer.getLastFrameAge(),
         "currentFps" to currentFps,
+        "netRateBps" to sampleNetRate(),
         "withinWindow" to isWithinTimeWindow(),
         "resolutions" to supportedResolutions(),
     )
@@ -1251,7 +1257,29 @@ class CameraService : LifecycleService(), StreamControl {
     }
 
     // 更新实际帧率（在编码线程中调用，体现真实推出去的帧）
+    /** 采样 MJPEG 出口速率（字节/秒）；不足 300ms 时返回上次值，避免抖动 */
     @Synchronized
+    private fun sampleNetRate(): Long {
+        if (!mjpegEnabled) {
+            netRateBps = 0L
+            return 0L
+        }
+        val sb = mjpegStreamer.getSentBytes()
+        val now = System.currentTimeMillis()
+        if (netSampleTs == 0L) {
+            netSampleBytes = sb
+            netSampleTs = now
+            return netRateBps
+        }
+        val dt = now - netSampleTs
+        if (dt >= 300L) {
+            netRateBps = (sb - netSampleBytes).coerceAtLeast(0L) * 1000L / dt
+            netSampleBytes = sb
+            netSampleTs = now
+        }
+        return netRateBps
+    }
+
     private fun updateFps() {
         val now = System.currentTimeMillis()
         frameCount++
@@ -1262,6 +1290,7 @@ class CameraService : LifecycleService(), StreamControl {
             currentFps = frameCount
             frameCount = 0
             fpsWindowStart = now
+            sampleNetRate()  // 每秒同步采样一次网络速率
             val fpsIntent = Intent("com.hpu.selfcammonitor.FPS_UPDATE")
             fpsIntent.setPackage(packageName)  // 显式广播：防系统过滤隐式广播
             fpsIntent.putExtra("fps", currentFps)
