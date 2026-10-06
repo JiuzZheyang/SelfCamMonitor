@@ -17,7 +17,7 @@ interface StreamControl {
     /**
      * 应用配置项。支持键：
      *  - resolution  如 "1280x720"
-     *  - fps         1..30
+     *  - fps         1..60
      *  - facing      0=后置 1=前置
      *  - mode        0=连续录像 1=运动触发 2=仅预览
      *  - mjpeg       0/1 或 true/false
