@@ -66,8 +66,9 @@ class TsMuxer {
 
     private fun writeSection(out: ByteArrayOutputStream, pid: Int, section: ByteArray, cc: Int) {
         val buf = ByteArray(184)
-        System.arraycopy(section, 0, buf, 0, section.size)
-        java.util.Arrays.fill(buf, section.size, 184, 0xFF.toByte())
+        buf[0] = 0x00  // pointer_field：PSI 包 payload 必须以 0x00 开头（section 起始偏移）
+        System.arraycopy(section, 0, buf, 1, section.size)
+        java.util.Arrays.fill(buf, section.size + 1, 184, 0xFF.toByte())
         writeTsPackets(out, pid, buf, start = true, cc = cc, pcr90 = null)
     }
 
