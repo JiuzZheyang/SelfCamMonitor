@@ -27,6 +27,7 @@ import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.hpu.selfcammonitor.service.CameraService
+import com.hpu.selfcammonitor.service.TunnelService
 import com.hpu.selfcammonitor.utils.FileSizeFormatter
 import com.hpu.selfcammonitor.R
 import com.hpu.selfcammonitor.ui.recordings.RecordingsActivity
@@ -250,6 +251,11 @@ class MainActivity : AppCompatActivity() {
         // 初始UI状态
         updateUI(isServiceRunning())
         updateStorageInfo()
+
+        // 启动 App 时按配置自动拉起内网穿透（可在设置页关闭/选择开启哪些）
+        if (prefs.getBoolean(TunnelService.PREF_AUTO_START, true)) {
+            TunnelService.startAllEnabled(this)
+        }
 
         // 使用 OnBackPressedDispatcher 处理返回键（兼容 Android 13+）
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
