@@ -96,9 +96,6 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
     private fun servePlaylist(): Response {
         hlsManager.noteClient()
         val pl = hlsManager.playlist()
-            ?: return newFixedLengthResponse(
-                Response.Status.SERVICE_UNAVAILABLE, "text/plain", "#EXTM3U\n# 等待首个分片..."
-            )
         val res = newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", pl)
         res.addHeader("Cache-Control", "no-store")
         return res
@@ -323,6 +320,7 @@ main{flex:1;display:flex;flex-direction:column;min-height:0}
 .iconbtn{width:44px;height:44px;border-radius:50%;border:1px solid rgba(255,255,255,.18);background:rgba(20,25,32,.72);color:#e6ebf2;font-size:17px;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px);touch-action:manipulation}
 .iconbtn:active{background:rgba(59,130,246,.85)}
 .iconbtn.rec.on{background:var(--err);border-color:var(--err)}
+.iconbtn.on{background:var(--acc);border-color:var(--acc)}
 .vtoolbar.up{bottom:70px}
 #dvr{position:absolute;left:12px;right:12px;bottom:12px;display:none;align-items:center;gap:10px;background:rgba(20,25,32,.74);border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:8px 12px;z-index:7;backdrop-filter:blur(6px)}
 #dvr.show{display:flex}
@@ -380,6 +378,7 @@ main{flex-direction:row}
 <button class="iconbtn" id="btn-shot" title="截图">&#128247;</button>
 <button class="iconbtn rec" id="btn-rec" title="录像">&#9679;</button>
 <button class="iconbtn" id="btn-fs" title="全屏">&#9974;</button>
+<button class="iconbtn" id="btn-snd" title="声音">&#128263;</button>
 </div>
 </div>
 <aside id="panel">
@@ -407,7 +406,9 @@ pinfo=document.getElementById('pinfo'),toastEl=document.getElementById('toast');
 var dvrEl=document.getElementById('dvr'),dvSeek=document.getElementById('dvr-seek'),
 dvLive=document.getElementById('dvr-live'),dvTime=document.getElementById('dvr-time'),
 vtEl=document.getElementById('vtoolbar');
-var dragging=false,hlsFallbackTimer=null;
+var btnSnd=document.getElementById('btn-snd');
+var soundOn=false;
+var dragging=false,hlsFallbackTimer=null,lastHlsErr='';
 var HI=2000;
 var activeEl=img,useHls=false;
 var rot=0,zoom=1,panX=0,panY=0,stat='connecting',wantStream=true,reloadTimer=null;
@@ -494,6 +495,7 @@ function refresh(d){
   bProto.textContent=(useHls?'HLS(TS)':'MJPEG');
   var parts=[];
   parts.push('模式: '+(d.modeLabel||'--'));
+  if(typeof d.audio==='boolean')parts.push('音频: '+(d.audio?'开':'关'));
   if(typeof d.h264Bitrate==='number'&&d.h264Bitrate>0)parts.push('编码: '+(d.h264Bitrate/1000000).toFixed(1)+'Mbps');
   if(typeof d.hlsSegments==='number')parts.push('分片: '+d.hlsSegments);
   if(typeof d.netRateBps==='number')parts.push('网络: '+fmtRate(d.netRateBps));
@@ -559,14 +561,16 @@ function startHls(){
   hlsFallbackTimer=setTimeout(function(){if(useHls&&!firstLoad){toast('HLS 无数据，回退 MJPEG');startMjpeg();}},12000);
   if(window.Hls&&Hls.isSupported()){
     if(hls){try{hls.destroy();}catch(e){}}
-    hls=new Hls({lowLatencyMode:true,liveSyncDurationCount:parseInt(selBuf.value,10)||2,
-      maxBufferLength:15,maxMaxBufferLength:60,backBufferLength:120,enableWorker:true,
-      liveDurationInfinity:true,manifestLoadingMaxRetry:10,levelLoadingMaxRetry:10,fragLoadingMaxRetry:10});
+    hls=new Hls({lowLatencyMode:(parseInt(selBuf.value,10)<=1),liveSyncDurationCount:parseInt(selBuf.value,10)||2,
+      maxBufferLength:(parseInt(selBuf.value,10)||2)*12,maxMaxBufferLength:(parseInt(selBuf.value,10)||2)*24,backBufferLength:120,enableWorker:true,
+      liveDurationInfinity:true,manifestLoadingMaxRetry:10,manifestLoadingRetryDelay:800,
+      levelLoadingMaxRetry:10,fragLoadingMaxRetry:10,maxLiveSyncPlaybackRate:1.5});
     hls.on(Hls.Events.ERROR,function(ev,data){
-      if(data&&data.fatal){
-        if(data.type==='networkError'){setStatus('disconnected');}
-        else{toast('HLS 错误，回退 MJPEG');startMjpeg();}
-      }
+      if(!data||!data.fatal)return;
+      lastHlsErr=data.type+'/'+data.details;
+      pinfo.textContent='HLS 错误: '+lastHlsErr+(data.reason?(' | '+data.reason):'');
+      toast('HLS 错误('+data.details+')，回退 MJPEG');
+      startMjpeg();
     });
     hls.loadSource('/live.m3u8?t='+Date.now());
     hls.attachMedia(video);
@@ -637,6 +641,15 @@ document.getElementById('btn-r').addEventListener('click',doRotate);
 document.getElementById('btn-fs').addEventListener('click',toggleFs);
 document.getElementById('btn-shot').addEventListener('click',snapshot);
 btnRec.addEventListener('click',toggleRec);
+function toggleSound(){
+  soundOn=!soundOn;
+  video.muted=!soundOn;
+  if(soundOn){video.volume=1;try{video.play().catch(function(){});}catch(e){}}
+  btnSnd.innerHTML=soundOn?'&#128266;':'&#128263;';
+  btnSnd.classList.toggle('on',soundOn);
+  if(soundOn&&lastState&&lastState.audio===false)toast('该路流无音频（麦克风未授权）');
+}
+btnSnd.addEventListener('click',toggleSound);
 selBuf.addEventListener('change',applyBufferPreset);
 selRes.addEventListener('change',function(){applyConfig({resolution:selRes.value},'分辨率将重启相机生效');resFilled=false;});
 selFace.addEventListener('change',function(){resFilled=false;selRes.innerHTML='';applyConfig({facing:selFace.value},'已切换摄像头');});
