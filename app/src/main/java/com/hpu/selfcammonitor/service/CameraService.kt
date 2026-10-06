@@ -78,6 +78,7 @@ class CameraService : LifecycleService(), StreamControl {
     @Volatile private var h264Width = 0
     @Volatile private var h264Height = 0
     @Volatile private var h264Bitrate = 0
+    private var h264LastStartAttempt = 0L
 
     private val motionDetector = MotionDetector()
     private val alertManager = AlertManager()
@@ -599,7 +600,8 @@ class CameraService : LifecycleService(), StreamControl {
                     // MJPEG 推流：只在分析线程做 NV21 拷贝，随后覆盖式投递到编码槽位。
                     // 编码（旋转+JPEG）由单线程编码循环异步完成：分析线程快速返回，
                     // CameraX 不用等编码；编码积压时旧帧在编码前就被丢弃，不产生延迟累积
-                    if (mjpegEnabled) {
+                    if (mjpegEnabled && (mjpegStreamer.getClientCount() > 0 ||
+                                System.currentTimeMillis() - mjpegStreamer.lastSnapshotRequestMs < 3000)) {
                         val copyStart = System.nanoTime()
                         val nv21 = MJPEGStreamer.yuv420888ToNv21(imageProxy)
                         val copyCostMs = (System.nanoTime() - copyStart) / 1_000_000L
@@ -623,17 +625,23 @@ class CameraService : LifecycleService(), StreamControl {
                     // H.264 硬件编码推流：仅在有网页客户端时开启（省电）。
                     // 编码在相机分析线程内串行完成（单线程，无并发问题）
                     if (h264Enabled && h264Streamer.getClientCount() > 0) {
-                        if (h264Encoder == null) {
-                            startH264Encoder(
-                                imageProxy.width, imageProxy.height,
-                                imageProxy.imageInfo.rotationDegrees
-                            )
+                        val fw = imageProxy.width
+                        val fh = imageProxy.height
+                        if (h264Encoder == null || h264Width != fw || h264Height != fh) {
+                            val nowMs = System.currentTimeMillis()
+                            if (nowMs - h264LastStartAttempt > 3000) {
+                                h264LastStartAttempt = nowMs
+                                startH264Encoder(fw, fh, imageProxy.imageInfo.rotationDegrees)
+                            }
                         }
                         val enc = h264Encoder
                         if (enc != null && enc.isRunning) {
                             if (h264Streamer.consumeKeyframeRequest()) enc.requestKeyFrame()
                             val nv12 = MJPEGStreamer.yuv420888ToNv12(imageProxy)
-                            if (nv12 != null) enc.encode(nv12, imageProxy.width, imageProxy.height)
+                            if (nv12 != null) {
+                                enc.encode(nv12, fw, fh)
+                                updateFps()
+                            }
                         }
                     } else if (h264Encoder != null) {
                         stopH264Encoder()
