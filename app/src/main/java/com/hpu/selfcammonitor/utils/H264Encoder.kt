@@ -240,7 +240,7 @@ class H264Encoder(
         val profile = b[i + 1].toInt() and 0xFF
         val constraint = b[i + 2].toInt() and 0xFF
         val level = b[i + 3].toInt() and 0xFF
-        return "avc1.%02X%02X%02X".format(profile, constraint, level)
+        return "avc1.%02x%02x%02x".format(profile, constraint, level)
     }
 
     private fun startsWithSps(data: ByteArray): Boolean {
