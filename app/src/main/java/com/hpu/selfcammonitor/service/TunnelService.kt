@@ -6,6 +6,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.os.Build
@@ -20,10 +21,10 @@ import java.io.File
 import java.io.InputStreamReader
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * 内网穿透服务：支持 cloudflared (Cloudflare Tunnel) 和 frp 两种模式。
+ * 内网穿透服务：支持 cloudflared (Cloudflare Tunnel) 与 frp 两种模式，
+ * 且**两者可同时运行**（互不影响）。
  *
  * 二进制以 jniLibs 下的 lib*.so 形式打包（libcloudflared.so / libfrpc.so），安装时被系统解压到
  * applicationInfo.nativeLibraryDir（只读 + 可执行），以此绕开 Android 10+ 禁止从 app
@@ -31,6 +32,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * cloudflared: 使用 Tunnel Token 认证（`tunnel run --token <token>`）。
  * frp:         生成 frpc.ini，支持 TCP（remote_port）与 HTTP（custom_domains）两种代理。
+ *
+ * 状态按类型分别维护：cfRunning/frpRunning、cfUrl/frpUrl。广播 [BROADCAST_TUNNEL_STATUS]
+ * 附带 type 字段，界面据此分别刷新。全部停止后服务自动 stopSelf。
  */
 class TunnelService : Service() {
 
@@ -41,10 +45,10 @@ class TunnelService : Service() {
     @Volatile private var cloudflaredProcess: Process? = null
     @Volatile private var frpcProcess: Process? = null
 
-    @Volatile private var currentTunnelType: String = TYPE_NONE
-    @Volatile private var tunnelUrl: String = ""
-
-    private val isRunning = AtomicBoolean(false)
+    @Volatile private var cfRunning = false
+    @Volatile private var frpRunning = false
+    @Volatile private var cfUrl = ""
+    @Volatile private var frpUrl = ""
 
     private val channelId = "tunnel_service_channel"
     private val notificationId = 2
@@ -55,10 +59,16 @@ class TunnelService : Service() {
         const val ACTION_START = "com.hpu.selfcammonitor.tunnel.START"
         const val ACTION_STOP = "com.hpu.selfcammonitor.tunnel.STOP"
         const val ACTION_RESTART = "com.hpu.selfcammonitor.tunnel.RESTART"
+        const val ACTION_START_ALL = "com.hpu.selfcammonitor.tunnel.START_ALL"
 
         const val TYPE_NONE = "none"
         const val TYPE_CLOUDFLARED = "cloudflared"
         const val TYPE_FRP = "frp"
+
+        // 偏好键（同时供设置页/自动启动使用）
+        const val PREF_CF_ENABLED = "cf_enabled"
+        const val PREF_FRP_ENABLED = "frp_enabled"
+        const val PREF_AUTO_START = "tunnel_auto_start"
 
         const val EXTRA_TUNNEL_TYPE = "tunnel_type"
         const val EXTRA_CLOUDFLARED_TOKEN = "cloudflared_token"
@@ -76,9 +86,23 @@ class TunnelService : Service() {
 
         @Volatile private var instance: TunnelService? = null
 
-        fun isTunnelRunning(): Boolean = instance?.isRunning?.get() == true
-        fun getTunnelUrl(): String = instance?.tunnelUrl ?: ""
-        fun getTunnelType(): String = instance?.currentTunnelType ?: TYPE_NONE
+        /** 任意一种穿透是否在运行 */
+        fun isTunnelRunning(): Boolean = instance?.anyRunning() == true
+
+        /** 指定类型是否在运行 */
+        fun isTunnelRunning(type: String): Boolean = instance?.isTypeRunning(type) == true
+
+        /** 首个运行中的穿透地址（兼容旧调用） */
+        fun getTunnelUrl(): String = instance?.firstUrl() ?: ""
+
+        /** 指定类型的穿透地址 */
+        fun getTunnelUrl(type: String): String = instance?.urlOf(type) ?: ""
+
+        /** 首个运行中的穿透类型（兼容旧调用） */
+        fun getTunnelType(): String = instance?.runningTypes()?.firstOrNull() ?: TYPE_NONE
+
+        /** 当前运行中的全部穿透类型 */
+        fun runningTypes(): List<String> = instance?.runningTypes() ?: emptyList()
 
         fun startTunnel(context: Context, type: String, extras: Map<String, String> = emptyMap()) {
             val intent = Intent(context, TunnelService::class.java).apply {
@@ -86,17 +110,38 @@ class TunnelService : Service() {
                 putExtra(EXTRA_TUNNEL_TYPE, type)
                 extras.forEach { putExtra(it.key, it.value) }
             }
-            ContextCompat.startForegroundService(context, intent)
+            startFgsSafely(context, intent)
         }
 
-        fun stopTunnel(context: Context) {
-            val intent = Intent(context, TunnelService::class.java).apply { action = ACTION_STOP }
-            context.startService(intent)
+        /** 启动所有在偏好中已启用的穿透（App 启动 / 开机时调用） */
+        fun startAllEnabled(context: Context) {
+            val intent = Intent(context, TunnelService::class.java).apply { action = ACTION_START_ALL }
+            startFgsSafely(context, intent)
         }
+
+        fun stopTunnel(context: Context, type: String = "") {
+            val intent = Intent(context, TunnelService::class.java).apply {
+                action = ACTION_STOP
+                putExtra(EXTRA_TUNNEL_TYPE, type)
+            }
+            runCatching { context.startService(intent) }
+        }
+
+        /** 停止全部穿透 */
+        fun stopAllTunnels(context: Context) = stopTunnel(context, "")
 
         fun restartTunnel(context: Context) {
             val intent = Intent(context, TunnelService::class.java).apply { action = ACTION_RESTART }
-            ContextCompat.startForegroundService(context, intent)
+            startFgsSafely(context, intent)
+        }
+
+        /** Android 12+ 后台启动前台服务可能抛异常，做兜底避免崩溃 */
+        private fun startFgsSafely(context: Context, intent: Intent) {
+            try {
+                ContextCompat.startForegroundService(context, intent)
+            } catch (e: Exception) {
+                Log.w(TAG, "启动穿透服务失败: ${e.message}")
+            }
         }
     }
 
@@ -133,12 +178,23 @@ class TunnelService : Service() {
                     )
                 }
             }
-            ACTION_RESTART -> {
-                updateNotification("正在重启内网穿透...")
-                killProcesses()
+            ACTION_START_ALL -> {
+                updateNotification("正在启动内网穿透...")
                 startFromPrefs()
             }
-            ACTION_STOP -> stopAll()
+            ACTION_RESTART -> {
+                updateNotification("正在重启内网穿透...")
+                killAll()
+                startFromPrefs()
+            }
+            ACTION_STOP -> {
+                val type = intent.getStringExtra(EXTRA_TUNNEL_TYPE) ?: ""
+                when (type) {
+                    TYPE_CLOUDFLARED -> stopType(TYPE_CLOUDFLARED)
+                    TYPE_FRP -> stopType(TYPE_FRP)
+                    else -> stopAll()
+                }
+            }
         }
         return START_STICKY
     }
@@ -148,19 +204,51 @@ class TunnelService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         // 只清理进程，不再广播（避免覆盖失败/停止原因）
-        killProcesses()
+        killAll()
         stopDnsForwarder()
-        currentTunnelType = TYPE_NONE
         instance = null
         executor.shutdown()
     }
 
-    /** 从 SharedPreferences 读取配置并按需启动对应穿透 */
+    // ─── 状态查询 ─────────────────────────────────────────────────
+
+    private fun anyRunning(): Boolean = cfRunning || frpRunning
+
+    private fun isTypeRunning(type: String): Boolean = when (type) {
+        TYPE_CLOUDFLARED -> cfRunning
+        TYPE_FRP -> frpRunning
+        else -> false
+    }
+
+    private fun urlOf(type: String): String = when (type) {
+        TYPE_CLOUDFLARED -> cfUrl
+        TYPE_FRP -> frpUrl
+        else -> ""
+    }
+
+    private fun firstUrl(): String = when {
+        cfRunning && cfUrl.isNotBlank() -> cfUrl
+        frpRunning && frpUrl.isNotBlank() -> frpUrl
+        cfRunning -> cfUrl
+        frpRunning -> frpUrl
+        else -> ""
+    }
+
+    private fun runningTypes(): List<String> {
+        val out = mutableListOf<String>()
+        if (cfRunning) out.add(TYPE_CLOUDFLARED)
+        if (frpRunning) out.add(TYPE_FRP)
+        return out
+    }
+
+    /** 从 SharedPreferences 读取配置并按需启动已启用的穿透（不会停掉已在运行的） */
     private fun startFromPrefs() {
         val prefs = getSharedPreferences("camera_prefs", MODE_PRIVATE)
-        when (prefs.getString("tunnel_type", TYPE_NONE)) {
-            TYPE_CLOUDFLARED -> startCloudflared(prefs.getString("cloudflared_token", "") ?: "")
-            TYPE_FRP -> startFrpc(
+        if (cfEnabled(prefs) && !cfRunning) {
+            startCloudflared(prefs.getString("cloudflared_token", "") ?: "")
+        }
+        if (frpEnabled(prefs) && !frpRunning) {
+            startFrpc(
                 server = prefs.getString("frp_server", "") ?: "",
                 serverPort = prefs.getString("frp_server_port", "7000")?.toIntOrNull() ?: 7000,
                 token = prefs.getString("frp_token", "") ?: "",
@@ -178,16 +266,17 @@ class TunnelService : Service() {
 
     private fun startCloudflared(token: String) {
         if (token.isBlank()) {
-            failAndStop(TYPE_CLOUDFLARED, "Token 为空，请先在设置中配置")
+            markFailed(TYPE_CLOUDFLARED, "Token 为空，请先在设置中配置")
             return
         }
-        killProcesses()
-        currentTunnelType = TYPE_CLOUDFLARED
-        tunnelUrl = ""
+        // 只重启 cloudflared，不影响 frp
+        killCloudflared()
+        cfRunning = false
+        cfUrl = ""
 
         executor.execute {
             val binary = prepareBinary("libcloudflared.so") ?: run {
-                failAndStop(TYPE_CLOUDFLARED, "找不到 cloudflared 可执行文件")
+                markFailed(TYPE_CLOUDFLARED, "找不到 cloudflared 可执行文件")
                 return@execute
             }
 
@@ -205,7 +294,7 @@ class TunnelService : Service() {
                 Log.w(TAG, "边缘发现失败: ${e.message}")
                 emptyList()
             }
-            updateNotification("正在连接 Cloudflare...")
+            updateNotification(notificationText("正在连接 Cloudflare..."))
 
             val proc = try {
                 ProcessBuilder(cmd)
@@ -221,12 +310,14 @@ class TunnelService : Service() {
                     .start()
             } catch (e: Exception) {
                 Log.e(TAG, "cloudflared 启动失败", e)
-                failAndStop(TYPE_CLOUDFLARED, e.message ?: "启动失败")
+                markFailed(TYPE_CLOUDFLARED, e.message ?: "启动失败")
                 return@execute
             }
 
             cloudflaredProcess = proc
-            isRunning.set(true)
+            cfRunning = true
+            broadcastStatus(TYPE_CLOUDFLARED, "", true, "")
+            refreshNotification()
 
             var lastErr = ""
             var connected = false
@@ -234,21 +325,18 @@ class TunnelService : Service() {
                 if (!connected && line.contains("registered tunnel connection", ignoreCase = true)) {
                     connected = true
                     val domain = extractDomain(line)
-                    tunnelUrl = when {
+                    cfUrl = when {
                         domain.startsWith("http") -> domain
                         domain.isNotEmpty() -> "https://$domain"
-                        else -> "已连接 Cloudflare Tunnel"
+                        else -> ""
                     }
-                    updateNotification("穿透运行中: $tunnelUrl")
-                    broadcastStatus(TYPE_CLOUDFLARED, tunnelUrl, true, "")
+                    broadcastStatus(TYPE_CLOUDFLARED, cfUrl, true, "")
+                    refreshNotification()
                 }
                 if (line.contains("err", ignoreCase = true) || line.contains("failed", ignoreCase = true)) lastErr = line
             }
 
-            onProcessEnded(proc) {
-                cloudflaredProcess = null
-                broadcastStatus(TYPE_CLOUDFLARED, tunnelUrl, false, lastErr.ifBlank { "连接已断开" })
-            }
+            onProcessEnded(proc, TYPE_CLOUDFLARED, cfUrl, lastErr)
         }
     }
 
@@ -272,16 +360,17 @@ class TunnelService : Service() {
         subdomain: String, domain: String, protocol: String, remotePort: Int,
     ) {
         if (server.isBlank()) {
-            failAndStop(TYPE_FRP, "frps 服务器地址为空")
+            markFailed(TYPE_FRP, "frps 服务器地址为空")
             return
         }
-        killProcesses()
-        currentTunnelType = TYPE_FRP
-        tunnelUrl = ""
+        // 只重启 frp，不影响 cloudflared
+        killFrpc()
+        frpRunning = false
+        frpUrl = ""
 
         executor.execute {
             val binary = prepareBinary("libfrpc.so") ?: run {
-                failAndStop(TYPE_FRP, "找不到 frpc 可执行文件")
+                markFailed(TYPE_FRP, "找不到 frpc 可执行文件")
                 return@execute
             }
 
@@ -320,7 +409,7 @@ class TunnelService : Service() {
 
             val cmd = listOf(binary.absolutePath, "-c", iniFile.absolutePath)
             Log.d(TAG, "启动 frpc: $cmd")
-            updateNotification("正在连接 frps $server...")
+            updateNotification(notificationText("正在连接 frps $server..."))
 
             val proc = try {
                 ProcessBuilder(cmd)
@@ -329,12 +418,14 @@ class TunnelService : Service() {
                     .start()
             } catch (e: Exception) {
                 Log.e(TAG, "frpc 启动失败", e)
-                failAndStop(TYPE_FRP, e.message ?: "启动失败")
+                markFailed(TYPE_FRP, e.message ?: "启动失败")
                 return@execute
             }
 
             frpcProcess = proc
-            isRunning.set(true)
+            frpRunning = true
+            broadcastStatus(TYPE_FRP, "", true, "")
+            refreshNotification()
 
             val httpUrl = "http://$customDomains"
             var announced = ""
@@ -344,9 +435,9 @@ class TunnelService : Service() {
             val announce: (String) -> Unit = { url ->
                 if (url != announced) {
                     announced = url
-                    tunnelUrl = url
-                    updateNotification("穿透运行中: $url")
+                    frpUrl = url
                     broadcastStatus(TYPE_FRP, url, true, "")
+                    refreshNotification()
                 }
             }
 
@@ -367,10 +458,7 @@ class TunnelService : Service() {
                 if (line.contains("err", ignoreCase = true) || line.contains("failed", ignoreCase = true)) lastErr = line
             }
 
-            onProcessEnded(proc) {
-                frpcProcess = null
-                broadcastStatus(TYPE_FRP, tunnelUrl, false, lastErr.ifBlank { "连接已断开" })
-            }
+            onProcessEnded(proc, TYPE_FRP, frpUrl, lastErr)
         }
     }
 
@@ -421,7 +509,8 @@ class TunnelService : Service() {
         dnsForwarder = null
     }
 
-    /** 从 nativeLibraryDir 取可执行二进制 */    private fun prepareBinary(name: String): File? {
+    /** 从 nativeLibraryDir 取可执行二进制 */
+    private fun prepareBinary(name: String): File? {
         val f = File(applicationInfo.nativeLibraryDir, name)
         if (!f.exists()) {
             Log.e(TAG, "nativeLibraryDir 中找不到 $name")
@@ -446,45 +535,94 @@ class TunnelService : Service() {
         }
     }
 
-    /** 进程自然结束时统一收尾（仅当没有任何新进程顶替时生效） */
-    private fun onProcessEnded(proc: Process, block: () -> Unit) {
-        isRunning.set(false)
-        // 若有新进程顶替（或已被 stopAll 清空），不覆盖当前状态
-        if (cloudflaredProcess === proc || frpcProcess === proc) {
-            block()
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+    /** 某类型进程自然结束：只清空并广播该类型；两者都停下后服务退出 */
+    private fun onProcessEnded(proc: Process, type: String, url: String, error: String) {
+        val wasCurrent = when (type) {
+            TYPE_CLOUDFLARED -> cloudflaredProcess === proc
+            else -> frpcProcess === proc
         }
+        if (type == TYPE_CLOUDFLARED) {
+            if (cloudflaredProcess === proc) {
+                cloudflaredProcess = null
+                cfRunning = false
+                cfUrl = ""
+            }
+        } else {
+            if (frpcProcess === proc) {
+                frpcProcess = null
+                frpRunning = false
+                frpUrl = ""
+            }
+        }
+        if (wasCurrent) {
+            broadcastStatus(type, url, false, error.ifBlank { "连接已断开" })
+        }
+        refreshNotification()
+        stopSelfIfIdle()
+    }
+
+    /** 停止单个类型（只杀对应进程） */
+    private fun stopType(type: String) {
+        if (type == TYPE_CLOUDFLARED) {
+            killCloudflared()
+            broadcastStatus(TYPE_CLOUDFLARED, "", false, "")
+        } else if (type == TYPE_FRP) {
+            killFrpc()
+            broadcastStatus(TYPE_FRP, "", false, "")
+        }
+        refreshNotification()
+        stopSelfIfIdle()
     }
 
     private fun stopAll() {
-        killProcesses()
+        killAll()
         stopDnsForwarder()
-        currentTunnelType = TYPE_NONE
-        tunnelUrl = ""
         // 主动停止不是错误：error 传空串，界面会显示“已停止”而非“错误: 已停止”
-        broadcastStatus(TYPE_NONE, "", false, "")
+        broadcastStatus(TYPE_CLOUDFLARED, "", false, "")
+        broadcastStatus(TYPE_FRP, "", false, "")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
-    private fun killProcesses() {
-        isRunning.set(false)
-        cloudflaredProcess?.destroy()
+    private fun killCloudflared() {
+        runCatching { cloudflaredProcess?.destroy() }
         cloudflaredProcess = null
-        frpcProcess?.destroy()
-        frpcProcess = null
+        cfRunning = false
+        cfUrl = ""
     }
 
-    /** 启动/连接失败：广播错误并停掉前台服务，避免通知栏卡在“正在启动” */
-    private fun failAndStop(type: String, msg: String) {
-        isRunning.set(false)
-        broadcastStatus(type, "", false, msg)
-        try {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-        } catch (_: Exception) {
+    private fun killFrpc() {
+        runCatching { frpcProcess?.destroy() }
+        frpcProcess = null
+        frpRunning = false
+        frpUrl = ""
+    }
+
+    private fun killAll() {
+        killCloudflared()
+        killFrpc()
+    }
+
+    /** 两者都不在运行则自行停止服务，避免通知常驻 */
+    private fun stopSelfIfIdle() {
+        if (!anyRunning()) {
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            } catch (_: Exception) {
+            }
         }
+    }
+
+    /** 启动/连接失败：广播错误并清理该类型；若再无运行项则停掉前台服务 */
+    private fun markFailed(type: String, msg: String) {
+        when (type) {
+            TYPE_CLOUDFLARED -> { cfRunning = false; cfUrl = "" }
+            TYPE_FRP -> { frpRunning = false; frpUrl = "" }
+        }
+        broadcastStatus(type, "", false, msg)
+        refreshNotification()
+        stopSelfIfIdle()
     }
 
     private fun createNotificationChannel() {
@@ -493,6 +631,19 @@ class TunnelService : Service() {
         val channel = NotificationChannel(channelId, "内网穿透服务", NotificationManager.IMPORTANCE_LOW)
             .apply { description = "保持内网穿透后台运行" }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+
+    /** 根据当前运行状态拼装通知文案 */
+    private fun notificationText(prefix: String): String {
+        val parts = mutableListOf<String>()
+        if (cfRunning) parts.add("Cloudflare: " + cfUrl.ifBlank { "连接中" })
+        if (frpRunning) parts.add("frp: " + frpUrl.ifBlank { "连接中" })
+        return if (parts.isEmpty()) prefix else parts.joinToString("  |  ")
+    }
+
+    private fun refreshNotification() {
+        if (!anyRunning()) return  // 全停时由 stopSelfIfIdle 处理，不再占用通知
+        updateNotification(notificationText("内网穿透"))
     }
 
     private fun updateNotification(text: String) {
@@ -521,4 +672,12 @@ class TunnelService : Service() {
             }
         )
     }
+
+    private fun cfEnabled(prefs: SharedPreferences): Boolean =
+        if (prefs.contains(PREF_CF_ENABLED)) prefs.getBoolean(PREF_CF_ENABLED, false)
+        else prefs.getString("tunnel_type", TYPE_NONE) == TYPE_CLOUDFLARED
+
+    private fun frpEnabled(prefs: SharedPreferences): Boolean =
+        if (prefs.contains(PREF_FRP_ENABLED)) prefs.getBoolean(PREF_FRP_ENABLED, false)
+        else prefs.getString("tunnel_type", TYPE_NONE) == TYPE_FRP
 }
