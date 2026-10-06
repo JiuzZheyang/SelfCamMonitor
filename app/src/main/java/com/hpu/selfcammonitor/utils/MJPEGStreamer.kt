@@ -184,6 +184,9 @@ class MJPEGStreamer {
     // 最新一帧 JPEG（供 /snapshot 端点使用）
     private val latestJpeg = AtomicReference<ByteArray?>(null)
 
+    // 累计向 MJPEG 客户端写出的字节数（供网页显示实时网络速率）
+    private val sentBytes = java.util.concurrent.atomic.AtomicLong(0)
+
     // 本地预览监听集合（并发安全：编码线程通知，UI 线程增删）
     private val frameListeners = ConcurrentHashMap.newKeySet<FrameListener>()
 
@@ -212,6 +215,9 @@ class MJPEGStreamer {
 
     /** 获取最新一帧 JPEG 数据（供 /snapshot 端点） */
     fun getLatestJpeg(): ByteArray? = latestJpeg.get()
+
+    /** 累计已写出的字节数（采样差值可算网络速率） */
+    fun getSentBytes(): Long = sentBytes.get()
 
     /** 当前 MJPEG 客户端数量 */
     fun getClientCount(): Int = clients.size
@@ -245,6 +251,7 @@ class MJPEGStreamer {
                     try {
                         info.outputStream.write(frameBytes)
                         info.outputStream.flush()
+                        sentBytes.addAndGet(frameBytes.size.toLong())
                     } catch (e: Exception) {
                         Log.w(TAG, "Client write failed, removing")
                         removeClient(info.outputStream)
