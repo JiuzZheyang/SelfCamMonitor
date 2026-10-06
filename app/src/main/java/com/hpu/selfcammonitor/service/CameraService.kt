@@ -46,7 +46,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import com.hpu.selfcammonitor.manager.AlertManager
 import com.hpu.selfcammonitor.utils.H264Encoder
-import com.hpu.selfcammonitor.utils.H264Streamer
+import com.hpu.selfcammonitor.utils.HlsManager
 import com.hpu.selfcammonitor.utils.MJPEGStreamer
 import com.hpu.selfcammonitor.utils.MotionDetector
 import com.hpu.selfcammonitor.ui.MainActivity
@@ -68,7 +68,7 @@ class CameraService : LifecycleService(), StreamControl {
     private var cameraProvider: ProcessCameraProvider? = null
 
     private lateinit var mjpegStreamer: MJPEGStreamer
-    private lateinit var h264Streamer: H264Streamer
+    private lateinit var hlsManager: HlsManager
     private lateinit var streamServer: StreamServer
 
     // H.264 硬件编码（网页低延迟播放）
@@ -236,11 +236,17 @@ class CameraService : LifecycleService(), StreamControl {
         // 配合 pendingEncode 槽位，单线程 + 覆盖式投递天然保序且自带丢帧
         encodeExecutor = Executors.newSingleThreadExecutor()
         mjpegStreamer = MJPEGStreamer()
-        h264Streamer = H264Streamer()
+        hlsManager = HlsManager(90)
         streamServer = StreamServer(8080)
         streamServer.setMJPEGStreamer(mjpegStreamer)
-        streamServer.setH264Streamer(h264Streamer)
+        streamServer.setHlsManager(hlsManager)
         streamServer.setControl(this)
+        // 读取内置 hls.js 资源（供网页播放器）
+        try {
+            assets.open("hls.min.js").use { streamServer.setHlsJs(it.readBytes()) }
+        } catch (e: Exception) {
+            Log.e(TAG, "读取 hls.min.js 失败", e)
+        }
 
         createNotificationChannel()
         acquireWakeLock()
@@ -624,7 +630,7 @@ class CameraService : LifecycleService(), StreamControl {
 
                     // H.264 硬件编码推流：仅在有网页客户端时开启（省电）。
                     // 编码在相机分析线程内串行完成（单线程，无并发问题）
-                    if (h264Enabled && h264Streamer.getClientCount() > 0) {
+                    if (h264Enabled && hlsManager.hasRecentClient()) {
                         val fw = imageProxy.width
                         val fh = imageProxy.height
                         if (h264Encoder == null || h264Width != fw || h264Height != fh) {
@@ -636,7 +642,7 @@ class CameraService : LifecycleService(), StreamControl {
                         }
                         val enc = h264Encoder
                         if (enc != null && enc.isRunning) {
-                            if (h264Streamer.consumeKeyframeRequest()) enc.requestKeyFrame()
+                            if (hlsManager.consumeKeyframeRequestIfAny()) enc.requestKeyFrame()
                             val nv12 = MJPEGStreamer.yuv420888ToNv12(imageProxy)
                             if (nv12 != null) {
                                 enc.encode(nv12, fw, fh)
@@ -865,7 +871,8 @@ class CameraService : LifecycleService(), StreamControl {
         "h264Width" to h264Width,
         "h264Height" to h264Height,
         "h264Bitrate" to h264Bitrate,
-        "h264Clients" to h264Streamer.getClientCount(),
+        "hlsSegments" to hlsManager.segmentCount(),
+        "hlsDvrSec" to 90,
         "withinWindow" to isWithinTimeWindow(),
         "resolutions" to supportedResolutions(),
     )
@@ -1315,7 +1322,7 @@ class CameraService : LifecycleService(), StreamControl {
             netRateBps = 0L
             return 0L
         }
-        val sb = mjpegStreamer.getSentBytes() + h264Streamer.getSentBytes()
+        val sb = mjpegStreamer.getSentBytes() + hlsManager.getServedBytes()
         val now = System.currentTimeMillis()
         if (netSampleTs == 0L) {
             netSampleBytes = sb
@@ -1339,8 +1346,8 @@ class CameraService : LifecycleService(), StreamControl {
         val fps = targetFps.coerceIn(1, 30)
         // 码率约为 0.07 bit/像素/帧（1080p@15 ≈ 2.2Mbps），钳制在 1.5~8 Mbps
         val bitrate = (w.toLong() * h * fps * 0.07).toInt().coerceIn(1_500_000, 8_000_000)
-        val enc = H264Encoder { annexb, key, _ ->
-            h264Streamer.pushFrame(annexb, key)
+        val enc = H264Encoder { annexb, key, ptsUs ->
+            hlsManager.feed(annexb, ptsUs * 9 / 100, key)
         }
         if (enc.start(w, h, fps, bitrate)) {
             h264Encoder = enc
