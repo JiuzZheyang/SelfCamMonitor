@@ -50,7 +50,33 @@ object DeviceStats {
             if (ua != null && ua != Int.MIN_VALUE) out["currentUa"] = ua
         } catch (_: Exception) {
         }
+        // 兼容部分设备：sticky 广播拿不到关键字段时，回退读 power_supply sysfs
+        try {
+            if (out["percent"] == null) sysfsInt("capacity")?.let { out["percent"] = it }
+            if (out["tempC"] == null) sysfsInt("temp")?.let { out["tempC"] = Math.round(it / 10.0 * 10) / 10.0 }
+            if (out["voltageMv"] == null) sysfsInt("voltage_now")?.let { out["voltageMv"] = it / 1000 }
+        } catch (_: Exception) {
+        }
         return out
+    }
+
+    /** 在 /sys/class/power_supply/*/ 下查找指定文件并读取为整数（读不到返回 null） */
+    private fun sysfsInt(name: String): Int? {
+        try {
+            val root = File("/sys/class/power_supply")
+            val dirs = root.listFiles() ?: return null
+            // 优先 battery，其次任意
+            val ordered = dirs.sortedByDescending { it.name.contains("battery", ignoreCase = true) }
+            for (dir in ordered) {
+                val f = File(dir, name)
+                if (f.exists()) {
+                    val v = f.readText().trim().toLongOrNull()
+                    if (v != null) return v.toInt()
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return null
     }
 
     /** SoC/CPU 温度（°C）：扫描 thermal zone 取最高值；取不到返回 null */

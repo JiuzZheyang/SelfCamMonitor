@@ -1045,7 +1045,8 @@ function fmtDur(s){s=Math.max(0,Math.floor(s));var d=Math.floor(s/86400),h=Math.
 function setBar(barId,pct,hot){var b=byId(barId);if(!b)return;b.classList.toggle('hot',!!hot);var i=b.querySelector('i');i.style.width=Math.max(0,Math.min(100,pct))+'%';}
 function render(d){
   if(!d||d.error)return;
-  var bat=d.battery||{};
+  var dev=d.device||{};
+  var bat=dev.battery||{};
   var pct=(typeof bat.percent==='number')?bat.percent:null;
   byId('bat').innerHTML=(pct==null?'--':pct)+'<small>%</small>';
   setBar('batbar',pct==null?0:pct,(pct!=null&&pct<=20));
@@ -1053,11 +1054,11 @@ function render(d){
   byId('btemp').textContent=(typeof bat.tempC==='number')?bat.tempC+' °C':'--';
   var cur=(typeof bat.currentUa==='number')?(Math.abs(bat.currentUa)/1000).toFixed(0)+' mA':'';
   byId('bvolt').textContent=((bat.voltageMv?bat.voltageMv+' mV':''))+(cur?(' / '+cur):'')||'--';
-  var ct=d.cpuTempC;
+  var ct=dev.cpuTempC;
   byId('cpuT').innerHTML=(typeof ct==='number')?ct+'<small>°C</small>':'--<small>°C</small>';
-  byId('cpuU').textContent=(typeof d.cpuUsagePct==='number')?(d.cpuUsagePct+' %'):'--';
-  byId('uptime').textContent=(typeof d.uptimeSec==='number')?fmtDur(d.uptimeSec):'--';
-  var mem=d.memory||{};
+  byId('cpuU').textContent=(typeof dev.cpuUsagePct==='number')?(dev.cpuUsagePct+' %'):'--';
+  byId('uptime').textContent=(typeof dev.uptimeSec==='number')?fmtDur(dev.uptimeSec):'--';
+  var mem=dev.memory||{};
   var mt=Number(mem.totalBytes)||0,ma=Number(mem.availBytes)||0,mu=mt-ma;
   var mp=mt>0?Math.round(mu*100/mt):null;
   byId('memP').innerHTML=(mp==null?'--':mp)+'<small>%</small>';
