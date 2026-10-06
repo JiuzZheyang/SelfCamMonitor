@@ -78,6 +78,60 @@ class MJPEGStreamer {
         }
 
         /**
+         * YUV_420_888 -> NV12（Y 平面 + 交错 UV）。
+         * 与 yuv420888ToNv21 结构相同，仅色度 U/V 顺序相反，供 H.264 编码器输入使用。
+         */
+        fun yuv420888ToNv12(image: ImageProxy): ByteArray? {
+            val width = image.width
+            val height = image.height
+            val yPlane = image.planes[0]
+            val uPlane = image.planes[1]
+            val vPlane = image.planes[2]
+
+            val yBuf = yPlane.buffer
+            val uBuf = uPlane.buffer
+            val vBuf = vPlane.buffer
+            yBuf.rewind(); uBuf.rewind(); vBuf.rewind()
+
+            val nv12 = ByteArray(width * height * 3 / 2)
+            var pos = 0
+
+            val yRowStride = yPlane.rowStride
+            for (row in 0 until height) {
+                if (yBuf.remaining() < width) break
+                yBuf.get(nv12, pos, width)
+                pos += width
+                if (yRowStride > width) {
+                    yBuf.position(yBuf.position() + (yRowStride - width))
+                }
+            }
+
+            val chromaWidth = width / 2
+            val chromaHeight = height / 2
+            val uRowStride = uPlane.rowStride
+            val vRowStride = vPlane.rowStride
+            val uPixelStride = uPlane.pixelStride
+            val vPixelStride = vPlane.pixelStride
+
+            for (row in 0 until chromaHeight) {
+                var uPos = row * uRowStride
+                var vPos = row * vRowStride
+                for (col in 0 until chromaWidth) {
+                    if (uPos >= uBuf.limit() || vPos >= vBuf.limit()) break
+                    uBuf.position(uPos)
+                    vBuf.position(vPos)
+                    val u = uBuf.get()
+                    val v = vBuf.get()
+                    nv12[pos++] = u
+                    nv12[pos++] = v
+                    uPos += uPixelStride
+                    vPos += vPixelStride
+                }
+            }
+            return nv12
+        }
+
+        /**
          * 旋转 NV21 数据。只支持 0/90/180/270 度。
          * 返回 Pair(旋转后的 nv21, 新的宽度)，新高度可通过长度反推。
          */
