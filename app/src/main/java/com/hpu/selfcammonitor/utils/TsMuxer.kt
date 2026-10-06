@@ -88,6 +88,7 @@ class TsMuxer {
             out.write(0x47)
             val b1 = (if (first && start) 0x40 else 0x00) or ((pid ushr 8) and 0x1F)
             out.write(b1)
+            out.write(pid and 0xFF)
             out.write(((afc shl 4) and 0x30) or (counter and CC_MASK))
 
             if (afc == 3) {
@@ -154,7 +155,7 @@ class TsMuxer {
     }
 
     private fun buildPat(): ByteArray {
-        val body = ByteArray(13)  // 5 header-after-length + 4 loop + 4 crc
+        val body = ByteArray(16)  // 3 header + 5 body + 4 loop + 4 crc
         var i = 0
         body[i++] = 0x00                                   // table_id
         body[i++] = (0xB0 or ((13 ushr 8) and 0x0F)).toByte()
@@ -167,7 +168,7 @@ class TsMuxer {
         body[i++] = (0xE0 or ((PID_PMT ushr 8) and 0x1F)).toByte()
         body[i++] = (PID_PMT and 0xFF).toByte()
         // CRC
-        val crc = crc32(body, 0, 9)
+        val crc = crc32(body, 0, 12)
         body[i++] = ((crc ushr 24) and 0xFF).toByte()
         body[i++] = ((crc ushr 16) and 0xFF).toByte()
         body[i++] = ((crc ushr 8) and 0xFF).toByte()
@@ -176,7 +177,7 @@ class TsMuxer {
     }
 
     private fun buildPmt(): ByteArray {
-        val body = ByteArray(18)
+        val body = ByteArray(21)
         var i = 0
         body[i++] = 0x02
         body[i++] = (0xB0 or ((18 ushr 8) and 0x0F)).toByte()
@@ -191,7 +192,7 @@ class TsMuxer {
         body[i++] = (0xE0 or ((PID_VIDEO ushr 8) and 0x1F)).toByte()
         body[i++] = (PID_VIDEO and 0xFF).toByte()
         body[i++] = 0xF0.toByte(); body[i++] = 0x00                 // ES_info_length = 0
-        val crc = crc32(body, 0, 14)
+        val crc = crc32(body, 0, 17)
         body[i++] = ((crc ushr 24) and 0xFF).toByte()
         body[i++] = ((crc ushr 16) and 0xFF).toByte()
         body[i++] = ((crc ushr 8) and 0xFF).toByte()
