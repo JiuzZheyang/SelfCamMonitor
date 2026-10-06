@@ -323,6 +323,14 @@ main{flex:1;display:flex;flex-direction:column;min-height:0}
 .iconbtn{width:44px;height:44px;border-radius:50%;border:1px solid rgba(255,255,255,.18);background:rgba(20,25,32,.72);color:#e6ebf2;font-size:17px;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px);touch-action:manipulation}
 .iconbtn:active{background:rgba(59,130,246,.85)}
 .iconbtn.rec.on{background:var(--err);border-color:var(--err)}
+.vtoolbar.up{bottom:70px}
+#dvr{position:absolute;left:12px;right:12px;bottom:12px;display:none;align-items:center;gap:10px;background:rgba(20,25,32,.74);border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:8px 12px;z-index:7;backdrop-filter:blur(6px)}
+#dvr.show{display:flex}
+.dvr-live{flex-shrink:0;font-size:11px;font-weight:700;color:var(--mut);background:var(--card2);border:1px solid var(--line);border-radius:999px;padding:5px 11px;cursor:pointer;letter-spacing:.5px}
+.dvr-live.on{color:#fff;background:var(--err);border-color:var(--err)}
+.dvr-live.off{color:#111;background:var(--warn);border-color:var(--warn)}
+#dvr-seek{flex:1;min-width:0;background:transparent;border:none;height:26px;cursor:pointer}
+.dvr-time{flex-shrink:0;font-size:12px;color:var(--mut);white-space:nowrap;font-variant-numeric:tabular-nums}
 #panel{flex-shrink:0;background:var(--card);border-top:1px solid var(--line);padding:12px 14px;display:flex;flex-direction:column;gap:12px;max-height:46vh;overflow-y:auto}
 .prow{display:flex;align-items:center;gap:10px}
 .prow label.k{width:64px;flex-shrink:0;font-size:13px;color:var(--mut)}
@@ -366,7 +374,8 @@ main{flex-direction:row}
 <img id="img" alt="监控画面" draggable="false">
 <video id="video" playsinline muted></video>
 <div id="overlay"></div>
-<div class="vtoolbar">
+<div id="dvr"><button class="dvr-live" id="dvr-live">LIVE</button><input id="dvr-seek" type="range" min="0" max="0" step="0.05" value="0"><span class="dvr-time" id="dvr-time">--</span></div>
+<div class="vtoolbar" id="vtoolbar">
 <button class="iconbtn" id="btn-r" title="旋转">&#8635;</button>
 <button class="iconbtn" id="btn-shot" title="截图">&#128247;</button>
 <button class="iconbtn rec" id="btn-rec" title="录像">&#9679;</button>
@@ -395,6 +404,10 @@ selMode=document.getElementById('sel-mode'),btnRec=document.getElementById('btn-
 bFps=document.getElementById('b-fps'),bNet=document.getElementById('b-net'),bBuf=document.getElementById('b-buf'),
 bRes=document.getElementById('b-res'),bRec=document.getElementById('b-rec'),bProto=document.getElementById('b-proto'),
 pinfo=document.getElementById('pinfo'),toastEl=document.getElementById('toast');
+var dvrEl=document.getElementById('dvr'),dvSeek=document.getElementById('dvr-seek'),
+dvLive=document.getElementById('dvr-live'),dvTime=document.getElementById('dvr-time'),
+vtEl=document.getElementById('vtoolbar');
+var dragging=false,hlsFallbackTimer=null;
 var HI=2000;
 var activeEl=img,useHls=false;
 var rot=0,zoom=1,panX=0,panY=0,stat='connecting',wantStream=true,reloadTimer=null;
@@ -495,6 +508,37 @@ function updateBufBadge(){
     }else{bBuf.textContent='--';}
   }catch(e){bBuf.textContent='--';}
 }
+var fmtT=function(s){s=Math.max(0,Math.floor(s));var m=Math.floor(s/60);s=s%60;return (m<10?'0':'')+m+':'+(s<10?'0':'')+s;};
+function updateSeek(){
+  if(!useHls||!video.seekable||!video.seekable.length){dvTime.textContent='--';return;}
+  var s0=video.seekable.start(0);
+  var s1=video.seekable.end(video.seekable.length-1);
+  if(s1-s0<0.5){dvTime.textContent='缓冲中...';return;}
+  dvSeek.min=s0;dvSeek.max=s1;
+  if(!dragging)dvSeek.value=video.currentTime;
+  var lag=s1-video.currentTime;
+  dvTime.textContent=fmtT(video.currentTime-s0)+' / '+fmtT(s1-s0)+'  ·  延迟 '+lag.toFixed(1)+'s';
+  dvLive.className='dvr-live '+(lag<3?'on':'off');
+  dvLive.textContent=(lag<3?'LIVE':'回看');
+}
+function seekTo(v){try{video.currentTime=v;if(video.paused)video.play().catch(function(){});}catch(e){}}
+function showDvr(on){
+  dvrEl.classList.toggle('show',on);
+  vtEl.classList.toggle('up',on);
+}
+if(dvSeek){
+  dvSeek.addEventListener('input',function(){
+    dragging=true;
+    var s0=parseFloat(dvSeek.min)||0;
+    dvTime.textContent=fmtT(parseFloat(dvSeek.value)-s0)+' / '+fmtT((parseFloat(dvSeek.max)||0)-s0)+'  ·  松手跳转';
+  });
+  dvSeek.addEventListener('change',function(){dragging=false;seekTo(parseFloat(dvSeek.value));});
+}
+if(dvLive){
+  dvLive.addEventListener('click',function(){
+    try{if(video.seekable&&video.seekable.length){var s1=video.seekable.end(video.seekable.length-1);video.currentTime=Math.max(0,s1-0.5);video.play().catch(function(){});toast('回到直播');}}catch(e){}
+  });
+}
 function applyBufferPreset(){
   var n=parseInt(selBuf.value,10)||2;
   if(hls){
@@ -510,7 +554,9 @@ function applyBufferPreset(){
 function startHls(){
   useHls=true;firstLoad=false;
   img.style.display='none';video.style.display='block';activeEl=video;
-  setStatus('connecting');img.removeAttribute('src');bProto.textContent='HLS(TS)';
+  setStatus('connecting');img.removeAttribute('src');bProto.textContent='HLS(TS)';showDvr(true);
+  if(hlsFallbackTimer)clearTimeout(hlsFallbackTimer);
+  hlsFallbackTimer=setTimeout(function(){if(useHls&&!firstLoad){toast('HLS 无数据，回退 MJPEG');startMjpeg();}},12000);
   if(window.Hls&&Hls.isSupported()){
     if(hls){try{hls.destroy();}catch(e){}}
     hls=new Hls({lowLatencyMode:true,liveSyncDurationCount:parseInt(selBuf.value,10)||2,
@@ -529,12 +575,13 @@ function startHls(){
     video.src='/live.m3u8?t='+Date.now();
     video.play().catch(function(){});
   }
-  video.onplaying=function(){firstLoad=true;setStatus('live');};
+  video.onplaying=function(){firstLoad=true;if(hlsFallbackTimer)clearTimeout(hlsFallbackTimer);setStatus('live');};
   video.onwaiting=function(){if(stat==='live')setStatus('connecting');};
-  video.onplaying=function(){firstLoad=true;setStatus('live');};
 }
 function startMjpeg(){
   useHls=false;
+  if(hlsFallbackTimer)clearTimeout(hlsFallbackTimer);
+  showDvr(false);
   if(hls){try{hls.destroy();}catch(e){}hls=null;}
   try{video.pause();video.removeAttribute('src');video.load();}catch(e){}
   video.style.display='none';img.style.display='block';activeEl=img;
@@ -551,7 +598,7 @@ function chooseMode(){
 function heartbeat(){
   api('/api/state').then(function(d){
     refresh(d);
-    if(useHls){updateBufBadge();return;}
+    if(useHls){updateBufBadge();updateSeek();return;}
     if(d&&d.mjpegEnabled===false){
       if(wantStream){wantStream=false;img.removeAttribute('src');}
       setStatus('off');return;
