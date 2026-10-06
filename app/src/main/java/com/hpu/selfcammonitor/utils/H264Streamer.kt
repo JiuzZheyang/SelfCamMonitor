@@ -30,7 +30,7 @@ class H264Streamer {
     private data class ClientInfo(
         val outputStream: OutputStream,
         val pending: AtomicReference<ByteArray?> = AtomicReference(null),
-        val lock: Any = Any(),
+        val lock: java.lang.Object = java.lang.Object(),
         @Volatile var synced: Boolean = false
     )
 
