@@ -14,8 +14,8 @@ android {
         applicationId = "com.hpu.selfcammonitor"
         minSdk = 25
         targetSdk = 36
-        versionCode = 20
-        versionName = "2.5.1"
+        versionCode = 21
+        versionName = "2.6.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -67,6 +67,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-service:2.7.0")
 
     implementation("org.nanohttpd:nanohttpd:2.3.1")
+
+    // 二维码生成（本地，无需网络）
+    implementation("com.google.zxing:core:3.5.3")
 
     // 网络请求（用于发送报警）
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

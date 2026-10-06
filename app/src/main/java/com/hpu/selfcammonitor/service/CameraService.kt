@@ -49,6 +49,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import com.hpu.selfcammonitor.manager.AlertManager
 import com.hpu.selfcammonitor.utils.AudioStreamer
+import com.hpu.selfcammonitor.utils.DeviceStats
 import com.hpu.selfcammonitor.utils.H264Encoder
 import com.hpu.selfcammonitor.utils.HlsManager
 import com.hpu.selfcammonitor.utils.MJPEGStreamer
@@ -936,6 +937,29 @@ class CameraService : LifecycleService(), StreamControl {
 
     // ─── StreamControl 实现（网页端控制） ──────────────────────────
 
+    /** 设备运行状态（电量/温度/内存/CPU/运行时长/机型等），供网页「设备信息」页使用 */
+    private fun deviceInfo(): Map<String, Any?> {
+        val out = linkedMapOf<String, Any?>()
+        out["battery"] = DeviceStats.battery(this)
+        out["cpuTempC"] = DeviceStats.cpuTempC()
+        out["cpuUsagePct"] = DeviceStats.cpuUsagePct()
+        out["memory"] = DeviceStats.memory(this)
+        out["uptimeSec"] = DeviceStats.uptimeSec()
+        out["model"] = (Build.MANUFACTURER + " " + Build.MODEL).trim()
+        out["device"] = Build.DEVICE
+        out["android"] = Build.VERSION.RELEASE
+        out["sdkInt"] = Build.VERSION.SDK_INT
+        out["abi"] = Build.SUPPORTED_ABIS.firstOrNull() ?: ""
+        out["appVersion"] = appVersionName()
+        return out
+    }
+
+    private fun appVersionName(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+    } catch (_: Exception) {
+        ""
+    }
+
     override fun state(): Map<String, Any?> = linkedMapOf(
         "running" to isRunning,
         "mjpegEnabled" to mjpegEnabled,
@@ -973,6 +997,7 @@ class CameraService : LifecycleService(), StreamControl {
         "ondemand" to ondemandCamera,
         "reserveMb" to reserveMbCfg,
         "storage" to storageInfo(),
+        "device" to deviceInfo(),
         "resolutions" to supportedResolutions(),
     )
 

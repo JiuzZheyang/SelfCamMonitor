@@ -43,6 +43,14 @@
             </LinearLayout>
 
             <ImageButton
+                android:id="@+id/btnQr"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:src="@drawable/ic_qr"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="二维码分享" />
+
+            <ImageButton
                 android:id="@+id/btnSettings"
                 android:layout_width="48dp"
                 android:layout_height="48dp"

@@ -1,11 +1,13 @@
 package com.hpu.selfcammonitor.ui
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -18,6 +20,8 @@ import android.text.SpannableString
 import android.text.style.ForegroundColorSpan
 import android.widget.Button
 import android.widget.ImageButton
+import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -29,6 +33,7 @@ import com.google.android.material.switchmaterial.SwitchMaterial
 import com.hpu.selfcammonitor.service.CameraService
 import com.hpu.selfcammonitor.service.TunnelService
 import com.hpu.selfcammonitor.utils.FileSizeFormatter
+import com.hpu.selfcammonitor.utils.QrUtil
 import com.hpu.selfcammonitor.R
 import com.hpu.selfcammonitor.ui.recordings.RecordingsActivity
 import com.hpu.selfcammonitor.ui.settings.SettingsActivity
@@ -176,6 +181,10 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<ImageButton>(R.id.btnSettings).setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
+        findViewById<ImageButton>(R.id.btnQr).setOnClickListener {
+            showQrShareDialog()
         }
 
         // 加载保存的录像模式
@@ -392,6 +401,80 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         updateStorageInfo()
+    }
+
+    /** 二维码分享：显示当前最优访问地址的二维码，可切换 Cloudflare / frp / 局域网 */
+    private fun showQrShareDialog() {
+        val urls = linkedMapOf<String, String>()
+        TunnelService.getTunnelUrl(TunnelService.TYPE_CLOUDFLARED)?.takeIf { it.isNotBlank() }
+            ?.let { urls["Cloudflare"] = it }
+        TunnelService.getTunnelUrl(TunnelService.TYPE_FRP)?.takeIf { it.isNotBlank() }
+            ?.let { urls["frp"] = it }
+        localIpAddress()?.let { urls["局域网"] = "http://$it:8080" }
+
+        if (urls.isEmpty()) {
+            Toast.makeText(this, "暂无可用地址，请先启动服务或隧道", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val density = resources.displayMetrics.density
+        val pad = (20 * density).toInt()
+        val sizePx = (260 * density).toInt()
+
+        val iv = ImageView(this)
+        iv.setPadding(pad, pad, pad, pad)
+        iv.setBackgroundColor(android.graphics.Color.WHITE)
+
+        val tvUrl = TextView(this)
+        tvUrl.textSize = 13f
+        tvUrl.setTextColor(getColor(R.color.text_secondary))
+        tvUrl.gravity = android.view.Gravity.CENTER
+        tvUrl.setPadding(pad, (8 * density).toInt(), pad, 0)
+
+        val wrap = LinearLayout(this)
+        wrap.orientation = LinearLayout.VERTICAL
+        wrap.addView(iv, LinearLayout.LayoutParams(sizePx, sizePx))
+        wrap.addView(tvUrl)
+
+        val keys = urls.keys.toList()
+        val values = urls.values.toList()
+        var idx = 0
+
+        fun render(i: Int) {
+            idx = i
+            val u = values[i]
+            val bmp: Bitmap? = QrUtil.bitmap(u, 640)
+            if (bmp != null) iv.setImageBitmap(bmp) else iv.setImageDrawable(null)
+            tvUrl.text = "${keys[i]}\n$u"
+        }
+        render(0)
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("扫码打开监控")
+            .setView(wrap)
+            .setPositiveButton("关闭", null)
+            .setNeutralButton("切换线路", null)
+            .create()
+        dialog.setOnShowListener {
+            val neutral = dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+            if (keys.size > 1) {
+                neutral.setOnClickListener { render((idx + 1) % keys.size) }
+            } else {
+                neutral.visibility = View.GONE
+            }
+        }
+        dialog.show()
+    }
+
+    private fun localIpAddress(): String? {
+        return try {
+            java.net.NetworkInterface.getNetworkInterfaces().toList()
+                .flatMap { it.inetAddresses.toList() }
+                .firstOrNull { !it.isLoopbackAddress && it is java.net.Inet4Address }
+                ?.hostAddress
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun updateStorageInfo() {

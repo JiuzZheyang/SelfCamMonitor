@@ -21,6 +21,7 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
     var password: String? = null
 
     private var hlsJs: ByteArray? = null
+    private var hlsJsGz: ByteArray? = null
 
     /** 网页端控制入口（由 CameraService 注入） */
     @Volatile
@@ -36,6 +37,7 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
 
     fun setHlsJs(bytes: ByteArray) {
         this.hlsJs = bytes
+        this.hlsJsGz = null
     }
 
     fun setControl(c: StreamControl) {
@@ -80,6 +82,8 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
         val res = when {
             uri == "/" || uri == "/index.html" -> htmlPage()
             uri == "/gallery" || uri == "/gallery.html" -> galleryPage()
+            uri == "/info" || uri == "/info.html" -> infoPage()
+            uri == "/qr" -> serveQr(s)
             uri == "/live.m3u8" -> servePlaylist()
             uri.startsWith("/seg/") -> serveSegment(uri)
             uri == "/hls.js" -> serveHlsJs()
@@ -126,6 +130,12 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
         return res
     }
 
+    private fun infoPage(): Response {
+        val res = newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", INFO_HTML)
+        res.addHeader("Cache-Control", "no-store")
+        return res
+    }
+
     /** HLS 播放列表（滑动窗口，DVR） */
     private fun servePlaylist(): Response {
         hlsManager.noteClient()
@@ -154,11 +164,41 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
     private fun serveHlsJs(): Response {
         val bytes = hlsJs
             ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "no hls.js")
+        val gz = hlsJsGz ?: gzip(bytes).also { hlsJsGz = it }
         val res = newFixedLengthResponse(
             Response.Status.OK, "application/javascript; charset=utf-8",
-            ByteArrayInputStream(bytes), bytes.size.toLong()
+            ByteArrayInputStream(gz), gz.size.toLong()
         )
+        res.addHeader("Content-Encoding", "gzip")
+        res.addHeader("Vary", "Accept-Encoding")
         res.addHeader("Cache-Control", "public, max-age=86400")
+        return res
+    }
+
+    /** 一次性 gzip 压缩（hls.js 静态不变，压缩后缓存） */
+    private fun gzip(data: ByteArray): ByteArray {
+        val bos = java.io.ByteArrayOutputStream(data.size / 3)
+        java.util.zip.GZIPOutputStream(bos).use { it.write(data) }
+        return bos.toByteArray()
+    }
+
+    /** 生成二维码 PNG：默认取当前最优访问地址，可用 ?u= 指定、?size= 调整边长 */
+    private fun serveQr(session: IHTTPSession): Response {
+        val params = readParams(session)
+        var target = params["u"]?.trim().orEmpty()
+        if (target.isBlank()) {
+            val st = try { control?.state() ?: emptyMap<String, Any?>() } catch (_: Exception) { emptyMap<String, Any?>() }
+            target = (st["cfUrl"] as? String)?.takeIf { it.isNotBlank() }
+                ?: (st["frpUrl"] as? String)?.takeIf { it.isNotBlank() }
+                ?: ("http://" + (st["lanIp"] as? String ?: "127.0.0.1") + ":8080")
+        }
+        val size = (params["size"]?.toIntOrNull() ?: 512).coerceIn(128, 1024)
+        val png = com.hpu.selfcammonitor.utils.QrUtil.png(target, size)
+            ?: return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "qr error")
+        val res = newFixedLengthResponse(
+            Response.Status.OK, "image/png", ByteArrayInputStream(png), png.size.toLong()
+        )
+        res.addHeader("Cache-Control", "public, max-age=60")
         return res
     }
 
@@ -417,6 +457,8 @@ class StreamServer(port: Int = 8080) : NanoHTTPD(port) {
             "{\"path\":\"/play/<date>/<file>.mp4\",\"desc\":\"网页内联播放（支持 Range）\"}," +
             "{\"path\":\"/thumb/<date>/<file>.mp4\",\"desc\":\"缩略图 jpg\"}," +
             "{\"path\":\"/gallery\",\"desc\":\"录像相册网页\"}," +
+            "{\"path\":\"/info\",\"desc\":\"设备信息网页（电量/温度/内存/CPU）\"}," +
+            "{\"path\":\"/qr?u=&size=\",\"desc\":\"二维码 PNG（默认取最优访问地址）\"}," +
             "{\"path\":\"/api/state\",\"desc\":\"设备状态\"}," +
             "{\"path\":\"/api/config?resolution=&fps=&facing=&mode=&mjpeg=\",\"desc\":\"应用配置\"}," +
             "{\"path\":\"/api/snapshot\",\"desc\":\"下载当前截图\"}" +
@@ -622,6 +664,8 @@ main{flex-direction:row}
 <button class="iconbtn" id="btn-shot" title="截图">&#128247;</button>
 <button class="iconbtn rec" id="btn-rec" title="录像">&#9679;</button>
 <a class="iconbtn" id="btn-gal" href="/gallery" title="录像相册">&#128193;</a>
+<a class="iconbtn" id="btn-info" href="/info" title="设备信息">&#8505;</a>
+<a class="iconbtn" id="btn-qr" href="/qr" target="_blank" title="二维码">&#9638;</a>
 <button class="iconbtn" id="btn-fs" title="全屏">&#9974;</button>
 <button class="iconbtn" id="btn-snd" title="声音">&#128263;</button>
 </div>
@@ -938,6 +982,110 @@ document.addEventListener('webkitfullscreenchange',function(){applyTransform();}
 chooseMode();
 heartbeat();
 setInterval(heartbeat,HI);
+</script>
+</body>
+</html>
+        """.trimIndent()
+
+        private val INFO_HTML = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1216">
+<title>设备信息 - SelfCamMonitor</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0f1216;--card:#171b22;--card2:#1e242d;--fg:#e6e9ee;--dim:#8b95a3;--line:#262d37;--accent:#3b82f6;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444}
+body{background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;padding:14px;padding-bottom:40px}
+a{color:var(--accent);text-decoration:none}
+.top{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+.top .t{font-size:18px;font-weight:700;flex:1}
+.back{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:10px;background:var(--card2);border:1px solid var(--line);color:var(--fg);transition:transform .15s ease,box-shadow .15s ease,background .15s}
+.back:hover{transform:translateY(-2px);box-shadow:0 8px 20px rgba(0,0,0,.4);background:#252c36}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px 16px;transition:transform .15s ease,box-shadow .15s ease,border-color .15s}
+.card:hover{transform:translateY(-2px);box-shadow:0 10px 26px rgba(0,0,0,.45);border-color:#33405a}
+.card h3{font-size:13px;font-weight:600;color:var(--dim);letter-spacing:.05em;margin-bottom:10px;text-transform:uppercase}
+.big{font-size:30px;font-weight:750;line-height:1.1}
+.big small{font-size:15px;font-weight:600;color:var(--dim);margin-left:3px}
+.row{display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-bottom:1px dashed rgba(255,255,255,.05)}
+.row:last-child{border-bottom:0}
+.row .k{color:var(--dim)}
+.row .v{font-weight:600;text-align:right;word-break:break-all}
+.bar{height:9px;border-radius:6px;background:var(--card2);overflow:hidden;margin-top:8px}
+.bar>i{display:block;height:100%;border-radius:6px;background:linear-gradient(90deg,#22c55e,#3b82f6);transition:width .4s ease}
+.bar.hot>i{background:linear-gradient(90deg,#f59e0b,#ef4444)}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:middle;background:var(--dim)}
+.dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.dot.off{background:var(--err)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+.tag{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;background:var(--card2);border:1px solid var(--line);margin-right:6px}
+.tag.on{background:rgba(34,197,94,.16);border-color:rgba(34,197,94,.5);color:#7ee2a8}
+.tag.off{background:rgba(239,68,68,.14);border-color:rgba(239,68,68,.45);color:#f2a2a2}
+.foot{margin-top:18px;text-align:center;color:var(--dim);font-size:12px}
+</style>
+</head>
+<body>
+<div class="top"><span class="t">设备信息</span><a class="back" href="/">&#8592; 实时画面</a><a class="back" href="/gallery">&#128193; 相册</a></div>
+<div class="grid">
+<div class="card"><h3>电量</h3><div class="big" id="bat">--<small>%</small></div><div class="bar" id="batbar"><i style="width:0"></i></div><div class="row"><span class="k">状态</span><span class="v" id="bash">--</span></div><div class="row"><span class="k">电池温度</span><span class="v" id="btemp">--</span></div><div class="row"><span class="k">电压 / 电流</span><span class="v" id="bvolt">--</span></div></div>
+<div class="card"><h3>温度 / CPU</h3><div class="big" id="cpuT">--<small>°C</small></div><div class="row"><span class="k">CPU 使用率</span><span class="v" id="cpuU">--</span></div><div class="row"><span class="k">运行时长</span><span class="v" id="uptime">--</span></div></div>
+<div class="card"><h3>内存</h3><div class="big" id="memP">--<small>%</small></div><div class="bar" id="membar"><i style="width:0"></i></div><div class="row"><span class="k">已用 / 总计</span><span class="v" id="memtxt">--</span></div></div>
+<div class="card"><h3>存储</h3><div class="big" id="storeFree">--</div><div class="bar" id="storebar"><i style="width:0"></i></div><div class="row"><span class="k">录像占用</span><span class="v" id="storeRec">--</span></div><div class="row"><span class="k">精选数量</span><span class="v" id="storeStar">--</span></div></div>
+<div class="card"><h3>设备</h3><div class="row"><span class="k">机型</span><span class="v" id="model">--</span></div><div class="row"><span class="k">Android</span><span class="v" id="os">--</span></div><div class="row"><span class="k">架构</span><span class="v" id="abi">--</span></div><div class="row"><span class="k">App 版本</span><span class="v" id="appv">--</span></div></div>
+<div class="card"><h3>视频流 / 穿透</h3><div class="row"><span class="k">摄像头</span><span class="v" id="cam">--</span></div><div class="row"><span class="k">当前帧率</span><span class="v" id="fps">--</span></div><div class="row"><span class="k">分辨率</span><span class="v" id="res">--</span></div><div class="row"><span class="k">实时速率</span><span class="v" id="net">--</span></div><div class="row"><span class="k">正在录像</span><span class="v" id="rec">--</span></div><div class="row"><span class="k">Cloudflare</span><span class="v" id="cf">--</span></div><div class="row"><span class="k">frp</span><span class="v" id="frp">--</span></div><div class="row"><span class="k">局域网</span><span class="v mono" id="lan">--</span></div></div>
+</div>
+<div class="foot">SelfCamMonitor · <span id="ts">--</span></div>
+<script>
+function byId(i){return document.getElementById(i);}
+function fmtSize(n){n=Number(n)||0;if(!n)return '0 B';var u=['B','KB','MB','GB','TB'];var i=0;while(n>=1024&&i<u.length-1){n/=1024;i++;}return (i?n.toFixed(1):n)+' '+u[i];}
+function fmtDur(s){s=Math.max(0,Math.floor(s));var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);s=s%60;var o='';if(d)o+=d+'天';if(h)o+=h+'时';o+=m+'分'+s+'秒';return o;}
+function setBar(barId,pct,hot){var b=byId(barId);if(!b)return;b.classList.toggle('hot',!!hot);var i=b.querySelector('i');i.style.width=Math.max(0,Math.min(100,pct))+'%';}
+function render(d){
+  if(!d||d.error)return;
+  var bat=d.battery||{};
+  var pct=(typeof bat.percent==='number')?bat.percent:null;
+  byId('bat').innerHTML=(pct==null?'--':pct)+'<small>%</small>';
+  setBar('batbar',pct==null?0:pct,(pct!=null&&pct<=20));
+  byId('bash').textContent=(bat.charging?'充电中':'放电中')+(bat.plugged?('（'+bat.plugged+'）'):'');
+  byId('btemp').textContent=(typeof bat.tempC==='number')?bat.tempC+' °C':'--';
+  var cur=(typeof bat.currentUa==='number')?(Math.abs(bat.currentUa)/1000).toFixed(0)+' mA':'';
+  byId('bvolt').textContent=((bat.voltageMv?bat.voltageMv+' mV':''))+(cur?(' / '+cur):'')||'--';
+  var ct=d.cpuTempC;
+  byId('cpuT').innerHTML=(typeof ct==='number')?ct+'<small>°C</small>':'--<small>°C</small>';
+  byId('cpuU').textContent=(typeof d.cpuUsagePct==='number')?(d.cpuUsagePct+' %'):'--';
+  byId('uptime').textContent=(typeof d.uptimeSec==='number')?fmtDur(d.uptimeSec):'--';
+  var mem=d.memory||{};
+  var mt=Number(mem.totalBytes)||0,ma=Number(mem.availBytes)||0,mu=mt-ma;
+  var mp=mt>0?Math.round(mu*100/mt):null;
+  byId('memP').innerHTML=(mp==null?'--':mp)+'<small>%</small>';
+  setBar('membar',mp==null?0:mp,(mp!=null&&mp>=88));
+  byId('memtxt').textContent=fmtSize(mu)+' / '+fmtSize(mt);
+  var st=d.storage||{};
+  var tot=Number(st.totalBytes)||0,free=Number(st.freeBytes)||0,used=tot-free;
+  byId('storeFree').textContent='可用 '+fmtSize(free);
+  setBar('storebar',tot>0?Math.round(used*100/tot):0,(tot>0&&free/tot<0.08));
+  byId('storeRec').textContent=fmtSize(st.recordingBytes);
+  byId('storeStar').textContent=(st.starredCount||0)+' 个';
+  var dv=d.device||{};
+  byId('model').textContent=dv.model||'--';
+  byId('os').textContent='Android '+(dv.android||'--')+' (API '+(dv.sdkInt||'--')+')';
+  byId('abi').textContent=dv.abi||'--';
+  byId('appv').textContent=dv.appVersion||'--';
+  byId('cam').textContent=(typeof d.cameraActive==='boolean')?(d.cameraActive?'已开启':'休眠'+(d.ondemand?'（按需）':'')):'--';
+  byId('fps').textContent=(d.currentFps||0)+' fps';
+  byId('res').textContent=d.resolution||'--';
+  byId('net').textContent=(typeof d.netRateBps==='number')?((d.netRateBps/1048576).toFixed(2)+' MB/s'):'--';
+  byId('rec').textContent=(d.recording?'是':'否');
+  byId('cf').innerHTML=d.cfRunning?'<span class="tag on">运行</span>':'<span class="tag off">停止</span>';
+  byId('frp').innerHTML=d.frpRunning?'<span class="tag on">运行</span>':'<span class="tag off">停止</span>';
+  byId('lan').textContent=d.lanIp?('http://'+d.lanIp+':8080'):'--';
+  var nw=new Date();byId('ts').textContent=nw.toLocaleTimeString();
+}
+function tick(){fetch('/api/state',{cache:'no-store'}).then(function(r){return r.json();}).then(render).catch(function(){});}
+tick();setInterval(tick,3000);
 </script>
 </body>
 </html>
