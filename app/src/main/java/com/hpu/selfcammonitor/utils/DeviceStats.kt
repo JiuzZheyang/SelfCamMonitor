@@ -60,7 +60,7 @@ object DeviceStats {
         return out
     }
 
-    /** 在 /sys/class/power_supply/*/ 下查找指定文件并读取为整数（读不到返回 null） */
+    /** 在 /sys/class/power_supply 的子目录里查找指定文件并读为整数（读不到返回 null） */
     private fun sysfsInt(name: String): Int? {
         try {
             val root = File("/sys/class/power_supply")
