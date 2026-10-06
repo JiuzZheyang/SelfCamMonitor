@@ -45,6 +45,8 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import com.hpu.selfcammonitor.manager.AlertManager
+import com.hpu.selfcammonitor.utils.H264Encoder
+import com.hpu.selfcammonitor.utils.H264Streamer
 import com.hpu.selfcammonitor.utils.MJPEGStreamer
 import com.hpu.selfcammonitor.utils.MotionDetector
 import com.hpu.selfcammonitor.ui.MainActivity
@@ -66,7 +68,16 @@ class CameraService : LifecycleService(), StreamControl {
     private var cameraProvider: ProcessCameraProvider? = null
 
     private lateinit var mjpegStreamer: MJPEGStreamer
+    private lateinit var h264Streamer: H264Streamer
     private lateinit var streamServer: StreamServer
+
+    // H.264 硬件编码（网页低延迟播放）
+    @Volatile private var h264Enabled = true
+    @Volatile private var h264Encoder: H264Encoder? = null
+    @Volatile private var h264Rotation = 0
+    @Volatile private var h264Width = 0
+    @Volatile private var h264Height = 0
+    @Volatile private var h264Bitrate = 0
 
     private val motionDetector = MotionDetector()
     private val alertManager = AlertManager()
@@ -224,8 +235,10 @@ class CameraService : LifecycleService(), StreamControl {
         // 配合 pendingEncode 槽位，单线程 + 覆盖式投递天然保序且自带丢帧
         encodeExecutor = Executors.newSingleThreadExecutor()
         mjpegStreamer = MJPEGStreamer()
+        h264Streamer = H264Streamer()
         streamServer = StreamServer(8080)
         streamServer.setMJPEGStreamer(mjpegStreamer)
+        streamServer.setH264Streamer(h264Streamer)
         streamServer.setControl(this)
 
         createNotificationChannel()
@@ -271,6 +284,8 @@ class CameraService : LifecycleService(), StreamControl {
     private fun loadSettings() {
         val prefs = getSharedPreferences("camera_prefs", MODE_PRIVATE)
         mjpegEnabled = prefs.getBoolean("mjpeg_enabled", true)
+        // H.264 硬件编码推流（网页 WebCodecs 播放）；默认开启
+        h264Enabled = prefs.getBoolean("h264_enabled", true)
         // 运动报警开关：默认关闭；仅在已配置报警 URL 时服务端才真正发送
         motionAlertEnabled = prefs.getBoolean("motion_alert_enabled", false)
 
@@ -422,6 +437,7 @@ class CameraService : LifecycleService(), StreamControl {
         manualRecord?.stop()
         manualRecord = null
         streamServer.stop()
+        stopH264Encoder()
         cameraProvider?.unbindAll()
         cameraBound = false
         cameraExecutor.shutdown()
@@ -602,6 +618,25 @@ class CameraService : LifecycleService(), StreamControl {
                             )
                             synchronized(encodeLock) { encodeLock.notifyAll() }
                         }
+                    }
+
+                    // H.264 硬件编码推流：仅在有网页客户端时开启（省电）。
+                    // 编码在相机分析线程内串行完成（单线程，无并发问题）
+                    if (h264Enabled && h264Streamer.getClientCount() > 0) {
+                        if (h264Encoder == null) {
+                            startH264Encoder(
+                                imageProxy.width, imageProxy.height,
+                                imageProxy.imageInfo.rotationDegrees
+                            )
+                        }
+                        val enc = h264Encoder
+                        if (enc != null && enc.isRunning) {
+                            if (h264Streamer.consumeKeyframeRequest()) enc.requestKeyFrame()
+                            val nv12 = MJPEGStreamer.yuv420888ToNv12(imageProxy)
+                            if (nv12 != null) enc.encode(nv12, imageProxy.width, imageProxy.height)
+                        }
+                    } else if (h264Encoder != null) {
+                        stopH264Encoder()
                     }
 
                     val frameCost = System.currentTimeMillis() - frameStartTs
@@ -815,6 +850,14 @@ class CameraService : LifecycleService(), StreamControl {
         "lastFrameAge" to mjpegStreamer.getLastFrameAge(),
         "currentFps" to currentFps,
         "netRateBps" to sampleNetRate(),
+        "h264Ready" to (h264Encoder?.ready() == true),
+        "h264Enabled" to h264Enabled,
+        "h264Codec" to h264Encoder?.codecString,
+        "h264Rotation" to h264Rotation,
+        "h264Width" to h264Width,
+        "h264Height" to h264Height,
+        "h264Bitrate" to h264Bitrate,
+        "h264Clients" to h264Streamer.getClientCount(),
         "withinWindow" to isWithinTimeWindow(),
         "resolutions" to supportedResolutions(),
     )
@@ -1264,7 +1307,7 @@ class CameraService : LifecycleService(), StreamControl {
             netRateBps = 0L
             return 0L
         }
-        val sb = mjpegStreamer.getSentBytes()
+        val sb = mjpegStreamer.getSentBytes() + h264Streamer.getSentBytes()
         val now = System.currentTimeMillis()
         if (netSampleTs == 0L) {
             netSampleBytes = sb
@@ -1278,6 +1321,36 @@ class CameraService : LifecycleService(), StreamControl {
             netSampleTs = now
         }
         return netRateBps
+    }
+
+    // ─── H.264 编码器管理（仅在相机分析线程调用） ─────────────────
+
+    private fun startH264Encoder(w: Int, h: Int, rotation: Int) {
+        if (w <= 0 || h <= 0) return
+        stopH264Encoder()
+        val fps = targetFps.coerceIn(1, 30)
+        // 码率约为 0.07 bit/像素/帧（1080p@15 ≈ 2.2Mbps），钳制在 1.5~8 Mbps
+        val bitrate = (w.toLong() * h * fps * 0.07).toInt().coerceIn(1_500_000, 8_000_000)
+        val enc = H264Encoder { annexb, key, _ ->
+            h264Streamer.pushFrame(annexb, key)
+        }
+        if (enc.start(w, h, fps, bitrate)) {
+            h264Encoder = enc
+            h264Rotation = rotation
+            h264Width = w
+            h264Height = h
+            h264Bitrate = bitrate
+            Log.d(TAG, "H.264 编码器已启动 ${w}x$h @${fps}fps ${bitrate / 1000}kbps rot=$rotation")
+        }
+    }
+
+    private fun stopH264Encoder() {
+        h264Encoder?.stop()
+        h264Encoder = null
+        h264Rotation = 0
+        h264Width = 0
+        h264Height = 0
+        h264Bitrate = 0
     }
 
     private fun updateFps() {
